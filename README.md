@@ -23,6 +23,7 @@ m * x'' + c * x' + k * x = F(t)
 Install dependencies:
 ```bash
 pip install numpy matplotlib
+```
 
 ## Run the Simulation
 
