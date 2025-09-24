@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 
 """
-Mass–Spring–Damper System Simulation with PID Control (using RK4 integration, no SciPy required)
+Mass–Spring–Damper System Simulation with PID Control (using RK4 integration)
 
 This script simulates the response of a mass–spring–damper (MSD) system to various force inputs, with optional closed-loop PID control.
 
 Features:
     - Simulates the ODE: m * x'' + c * x' + k * x = F(t)
-    - Uses a custom 4th-order Runge–Kutta (RK4) integrator
+    - Uses a RK4 integrator
     - Supports open-loop (preset force input) and closed-loop (PID-controlled) simulations
     - Includes anti-windup and noise filtering in the PID controller
-    - Provides several example force/reference input functions (step, impulse, sinusoid, chirp)
+    - Provides example force/reference input functions (step, impulse, sinusoid, chirp)
     - Plots system response, control input, and energy over time
 
 Usage:
@@ -312,7 +312,7 @@ def c_to_zeta(c, m, k):
 
 if __name__ == "__main__":
     # System parameters
-    params = MSDParams(m=1.0, c=1.0, k=25.0)
+    params = MSDParams(m=20.0, c=20.0, k=0.0)
 
     # Simulation config for RK4
     cfg = SimConfig(t0=0.0, tf=10.0, dt=0.001, x0=0.0, v0=0.0)
@@ -321,7 +321,9 @@ if __name__ == "__main__":
     # Increase Kp until response with minor overshoot
     # Add Ki to remove steady-state error
     # Add Kd to dampen overshoot (set deriv_tau ~ 1–5*dt for smoothing)
-    pid = PID(Kp=800.0, Ki=0.0, Kd=0.0, u_min=-50.0, u_max=50.0, deriv_tau=0)
+    pid_p = PID(Kp=200.0, Ki=60.0, Kd=10.0, u_min=-50.0, u_max=50.0, deriv_tau=0.002)   #position PID
+    pid_v = PID(Kp=500.0, Ki=20.0, Kd=2.0, u_min=-50.0, u_max=50.0, deriv_tau=0.005)     #velocity PID
+
 
     # Choose one force input
     F = step_force(magnitude=1.0, t_delay=0.5)
@@ -336,16 +338,18 @@ if __name__ == "__main__":
     plot_results(t, x, v, u, E, KE, PE)
     '''
 
-    # Closed-loop simulation    
+    # Closed-loop simulation   
     msd = MassSpringDamper(params, force_fn=lambda t: 0.0)  # force is provided by the PID, ignore this F
-    ref = step_ref(magnitude=0.1, t_delay=0.5)
-    t, x, v, u, E, KE, PE, r_hist = msd.simulate_closed_loop(cfg, pid, ref_fn=ref, mode="position",  use_feedforward=False)
-    plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode="position", params=params)
 
     '''
-    # Velocity control example
-    ref_v = step_ref(magnitude=0.5, t_delay=0.5)  # 0.5 m/s
-    pid_v = PID(Kp=50.0, Ki=20.0, Kd=2.0, u_min=-50.0, u_max=50.0, deriv_tau=0.005)
-    t, x, v, u, E, KE, PE, r_hist = simulate_closed_loop(msd, cfg, pid_v, ref_fn=ref_v, mode="velocity")
-    plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode="velocity", params=params)
+    # Position control example
+    ref_p = step_ref(magnitude=0.1, t_delay=0.5)
+    t, x, v, u, E, KE, PE, r_hist = msd.simulate_closed_loop(cfg, pid, ref_fn=ref_p, mode="position",  use_feedforward=False)
+    plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode="position", params=params)
     '''
+    
+    # Velocity control example
+    ref_v = step_ref(magnitude=0.5, t_delay=2)  # 0.5 m/s
+    t, x, v, u, E, KE, PE, r_hist = msd.simulate_closed_loop(cfg, pid_v, ref_fn=ref_v, mode="velocity")
+    plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode="velocity", params=params)
+    
