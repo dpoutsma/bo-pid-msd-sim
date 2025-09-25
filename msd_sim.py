@@ -233,6 +233,161 @@ def chirp_force(A=1.0, f0=0.1, f1=5.0, tf=10.0):
 def step_ref(magnitude=0.1, t_delay=0.5):
     return lambda t: magnitude * (t >= t_delay)
 
+class ControlEvaluator:
+    """
+    Calculates and displays performance metrics for controller evaluation.
+    This class provides methods to assess tracking performance, dynamic response,
+    constraint handling, and other relevant metrics for control systems.
+    """
+    def __init__(self):
+        pass
+    
+    def evaluate(self, t, y, r, u, u_min, u_max, eps=0.02, final_pct=10):
+        """
+        Evaluates controller performance based on time series data.
+        
+        Args:
+            t: Array of time points
+            y: Array of measured outputs (position or velocity)
+            r: Array of reference signals (setpoints)
+            u: Array of control inputs
+            u_min, u_max: Minimum and maximum control input limits
+            eps: Settling band tolerance (default: 2%)
+            final_pct: Percentage of final points to use for steady-state calculation (default: 10%)
+        """
+        # Calculate error and time step
+        e = r - y
+        dt = t[1] - t[0] if len(t) > 1 else 0.001
+        N = len(t) - 1
+
+        # Initialize results dictionary
+        metrics = {}
+        
+        # ===== Tracking Performance =====
+        
+        # Integral Absolute Error (IAE)
+        iae = np.sum(np.abs(e)) * dt
+        metrics['IAE'] = iae
+        
+        # Integral Time Absolute Error (ITAE)
+        itae = np.sum(t * np.abs(e)) * dt
+        metrics['ITAE'] = itae
+        
+        # Root Mean Square Error (RMSE)
+        rmse = np.sqrt(np.mean(e**2))
+        metrics['RMSE'] = rmse
+        
+        # ===== Dynamic Response =====
+        
+        # Only for step references
+        if np.all(r == r[0]) or np.all(r[r>0] == r[np.where(r>0)[0][0]]):
+            # Get step characteristics
+            r_final = r[-1]  # Final reference value
+            r_step = r_final - r[0]  # Step size
+            
+            if abs(r_step) > 1e-6:  # Only if we have a significant step
+                # Rise time calculation (10% to 90%)
+                y_norm = (y - y[0]) / r_step
+                try:
+                    t_10 = t[np.where(y_norm >= 0.1)[0][0]]
+                    t_90 = t[np.where(y_norm >= 0.9)[0][0]]
+                    metrics['Rise time (10-90%)'] = t_90 - t_10
+                except IndexError:
+                    metrics['Rise time (10-90%)'] = float('nan')
+
+                # Overshoot
+                if r_step > 0:
+                    overshoot = (np.max(y) - r_final) / abs(r_final) * 100
+                else:
+                    overshoot = (r_final - np.min(y)) / abs(r_final) * 100
+                metrics['Overshoot (%)'] = max(0, overshoot)
+
+                # Settling time (2% band)
+                settled = np.where(np.abs(e) <= eps * abs(r_final))[0]
+                if len(settled) > 0:
+                    # Check if it's settled for all future points
+                    for idx in settled:
+                        if np.all(np.abs(e[idx:]) <= eps * abs(r_final)):
+                            metrics['Settling time (2%)'] = t[idx] - t[0]
+                            break
+                    else:
+                        metrics['Settling time (2%)'] = float('nan')
+                else:
+                    metrics['Settling time (2%)'] = float('nan')
+        
+        # Steady-state error (average of last X% of data points)
+        n_final = max(1, int(N * final_pct / 100))
+        metrics['Steady-state error'] = np.mean(np.abs(e[-n_final:]))
+        
+        # ===== Constraint Handling =====
+        
+        # Control saturation analysis
+        saturation_min = np.sum(np.isclose(u, u_min, atol=1e-6))
+        saturation_max = np.sum(np.isclose(u, u_max, atol=1e-6))
+        metrics['Saturation min (%)'] = saturation_min / len(u) * 100
+        metrics['Saturation max (%)'] = saturation_max / len(u) * 100
+        metrics['Total saturation (%)'] = (saturation_min + saturation_max) / len(u) * 100
+        
+        # Control rate analysis
+        u_rate = np.diff(u) / dt
+        metrics['Max control rate'] = np.max(np.abs(u_rate))
+        metrics['Mean control rate'] = np.mean(np.abs(u_rate))
+        
+        # Return all metrics
+        return metrics
+
+    def print_metrics(self, metrics):
+        """
+        Prints the calculated metrics in a formatted way.
+        """
+        print("\n" + "="*50)
+        print("CONTROLLER PERFORMANCE METRICS")
+        print("="*50)
+        
+        # Tracking performance
+        print("\n--- Tracking Performance ---")
+        print(f"IAE:   {metrics.get('IAE', 'N/A'):.4g}")
+        print(f"ITAE:  {metrics.get('ITAE', 'N/A'):.4g}")
+        print(f"RMSE:  {metrics.get('RMSE', 'N/A'):.4g}")
+        
+        # Dynamic response
+        print("\n--- Dynamic Response ---")
+        print(f"Rise time (10-90%): {metrics.get('Rise time (10-90%)', 'N/A'):.4g} s")
+        print(f"Settling time (2%): {metrics.get('Settling time (2%)', 'N/A'):.4g} s")
+        print(f"Overshoot:          {metrics.get('Overshoot (%)', 'N/A'):.2f} %")
+        print(f"Steady-state error: {metrics.get('Steady-state error', 'N/A'):.6g}")
+        
+        # Constraint handling
+        print("\n--- Constraint Handling ---")
+        print(f"Control saturation: {metrics.get('Total saturation (%)', 'N/A'):.2f} %")
+        print(f"Max control rate:   {metrics.get('Max control rate', 'N/A'):.4g}")
+        
+        print("\n" + "="*50 + "\n")
+        
+    def plot_error_analysis(self, t, y, r, e):
+        """
+        Creates plots to visualize tracking performance and error.
+        """
+        fig, axs = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        
+        # Plot 1: Reference vs Output
+        axs[0].plot(t, r, 'r--', label='Reference')
+        axs[0].plot(t, y, 'b-', label='Output')
+        axs[0].set_ylabel('Value')
+        axs[0].legend()
+        axs[0].grid(True, alpha=0.3)
+        axs[0].set_title('Reference Tracking')
+        
+        # Plot 2: Error
+        axs[1].plot(t, e, 'k-')
+        axs[1].set_ylabel('Error')
+        axs[1].set_xlabel('Time [s]')
+        axs[1].grid(True, alpha=0.3)
+        axs[1].set_title('Control Error')
+        
+        plt.tight_layout()
+        plt.show()
+
 def plot_results(t, x, v, u, E, KE, PE):
     fig, axs = plt.subplots(4, 1, figsize=(9, 10), sharex=True)
 
@@ -307,6 +462,8 @@ def plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode, params):
 
 def c_to_zeta(c, m, k):
     # Damping ratio ζ = c / (2*sqrt(k*m))
+    if k <= 0:
+        return float('inf')  # Pure damping system (no spring)
     return c / (2.0*np.sqrt(k*m))
 
 
@@ -321,35 +478,108 @@ if __name__ == "__main__":
     # Increase Kp until response with minor overshoot
     # Add Ki to remove steady-state error
     # Add Kd to dampen overshoot (set deriv_tau ~ 1–5*dt for smoothing)
-    pid_p = PID(Kp=200.0, Ki=60.0, Kd=10.0, u_min=-50.0, u_max=50.0, deriv_tau=0.002)   #position PID
-    pid_v = PID(Kp=500.0, Ki=20.0, Kd=2.0, u_min=-50.0, u_max=50.0, deriv_tau=0.005)     #velocity PID
+    pid_p = PID(Kp=200.0, Ki=60.0, Kd=10.0, u_min=-50.0, u_max=50.0, deriv_tau=0.002)   # position PID
+    pid_v = PID(Kp=500.0, Ki=20.0, Kd=2.0, u_min=-50.0, u_max=50.0, deriv_tau=0.005)    # velocity PID
 
+    # Initialize controller evaluator for performance metrics
+    evaluator = ControlEvaluator()
 
-    # Choose one force input
-    F = step_force(magnitude=1.0, t_delay=0.5)
-    # F = impulse_force(area=1.0, t0=0.2, width=0.01)
-    # F = sinusoid_force(A=1.0, freq_hz=1.0, phase=0.0)
-    # F = chirp_force(A=1.0, f0=0.2, f1=5.0, tf=cfg.tf)
-
-    '''
-    # Open-loop simulation
-    msd = MassSpringDamper(params, F)
-    t, x, v, u, E, KE, PE = msd.simulate(cfg)
-    plot_results(t, x, v, u, E, KE, PE)
-    '''
-
-    # Closed-loop simulation   
-    msd = MassSpringDamper(params, force_fn=lambda t: 0.0)  # force is provided by the PID, ignore this F
-
-    '''
-    # Position control example
-    ref_p = step_ref(magnitude=0.1, t_delay=0.5)
-    t, x, v, u, E, KE, PE, r_hist = msd.simulate_closed_loop(cfg, pid, ref_fn=ref_p, mode="position",  use_feedforward=False)
-    plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode="position", params=params)
-    '''
+    # Choose what to run
+    # Set to "open-loop", "position", "velocity", or "comparison"
+    run_mode = "position"  # Default: run both controllers and compare metrics
     
-    # Velocity control example
-    ref_v = step_ref(magnitude=0.5, t_delay=2)  # 0.5 m/s
-    t, x, v, u, E, KE, PE, r_hist = msd.simulate_closed_loop(cfg, pid_v, ref_fn=ref_v, mode="velocity")
-    plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode="velocity", params=params)
+    # Initialize MSD
+    msd = MassSpringDamper(params, force_fn=lambda t: 0.0)  # force is provided by the PID in closed-loop
+    
+    if run_mode == "open-loop":
+        # Open-loop simulation with step force
+
+        # Choose one force input
+        # F = step_force(magnitude=1.0, t_delay=0.5)
+        # F = impulse_force(area=1.0, t0=0.2, width=0.01)
+        F = sinusoid_force(A=1.0, freq_hz=1.0, phase=0.0)
+        # F = chirp_force(A=1.0, f0=0.2, f1=5.0, tf=cfg.tf)
+
+        msd = MassSpringDamper(params, F)
+        t, x, v, u, E, KE, PE = msd.simulate(cfg)
+        plot_results(t, x, v, u, E, KE, PE)
+    
+    elif run_mode == "position":
+        # Position control example
+        ref_p = step_ref(magnitude=0.1, t_delay=0.5)
+        t, x, v, u, E, KE, PE, r_hist = msd.simulate_closed_loop(cfg, pid_p, ref_fn=ref_p, mode="position", use_feedforward=False)
+        plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode="position", params=params)
+        
+        # Evaluate position controller performance
+        metrics = evaluator.evaluate(
+            t=t,
+            y=x,  # position is measured output
+            r=r_hist, 
+            u=u, 
+            u_min=pid_p.u_min, 
+            u_max=pid_p.u_max
+        )
+        evaluator.print_metrics(metrics)
+        
+        # Plot error analysis
+        error = r_hist - x
+        evaluator.plot_error_analysis(t, x, r_hist, error)
+    
+    elif run_mode == "velocity":
+        # Velocity control example
+        ref_v = step_ref(magnitude=0.5, t_delay=2.0)  # 0.5 m/s
+        t, x, v, u, E, KE, PE, r_hist = msd.simulate_closed_loop(cfg, pid_v, ref_fn=ref_v, mode="velocity")
+        plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode="velocity", params=params)
+        
+        # Evaluate velocity controller performance
+        metrics = evaluator.evaluate(
+            t=t, 
+            y=v,  # velocity is measured output
+            r=r_hist, 
+            u=u, 
+            u_min=pid_v.u_min, 
+            u_max=pid_v.u_max
+        )
+        evaluator.print_metrics(metrics)
+        
+        # Plot error analysis
+        error = r_hist - v
+        evaluator.plot_error_analysis(t, v, r_hist, error)
+    
+    else:  # "comparison" or any other value - compare both controllers
+        # Run position control
+        print("\n=== POSITION CONTROL TEST ===")
+        ref_p = step_ref(magnitude=0.1, t_delay=0.5)
+        t_p, x_p, v_p, u_p, E_p, KE_p, PE_p, r_p = msd.simulate_closed_loop(
+            cfg, pid_p, ref_fn=ref_p, mode="position", use_feedforward=False
+        )
+        
+        # Evaluate position controller
+        metrics_p = evaluator.evaluate(
+            t=t_p, y=x_p, r=r_p, u=u_p, 
+            u_min=pid_p.u_min, u_max=pid_p.u_max
+        )
+        evaluator.print_metrics(metrics_p)
+        
+        # Run velocity control
+        print("\n=== VELOCITY CONTROL TEST ===")
+        ref_v = step_ref(magnitude=0.5, t_delay=2.0)
+        t_v, x_v, v_v, u_v, E_v, KE_v, PE_v, r_v = msd.simulate_closed_loop(
+            cfg, pid_v, ref_fn=ref_v, mode="velocity"
+        )
+        
+        # Evaluate velocity controller
+        metrics_v = evaluator.evaluate(
+            t=t_v, y=v_v, r=r_v, u=u_v,
+            u_min=pid_v.u_min, u_max=pid_v.u_max
+        )
+        evaluator.print_metrics(metrics_v)
+        
+        # Plot results for both controllers
+        plot_closed_loop(t_p, x_p, v_p, u_p, E_p, KE_p, PE_p, r_p, mode="position", params=params)
+        plot_closed_loop(t_v, x_v, v_v, u_v, E_v, KE_v, PE_v, r_v, mode="velocity", params=params)
+        
+        # Plot error analysis for both controllers
+        evaluator.plot_error_analysis(t_p, x_p, r_p, r_p - x_p)
+        evaluator.plot_error_analysis(t_v, v_v, r_v, r_v - v_v)
     
