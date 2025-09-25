@@ -22,6 +22,7 @@ m * x'' + c * x' + k * x = F(t)
   - Chirp
 - Uses custom RK4 integration (no SciPy needed)
 - Plots results (state, control, energy, reference tracking) with Matplotlib
+- cascade pid 
 
 ## Requirements
 - Python 3.9+
