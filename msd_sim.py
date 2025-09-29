@@ -26,9 +26,9 @@ import matplotlib.pyplot as plt
 
 @dataclass
 class MSDParams:
-    m: float = 1.0     # mass [kg]
-    c: float = 0.5     # damping [N·s/m]
-    k: float = 20.0    # stiffness [N/m]
+    mass: float = 1.0     # mass [kg]
+    damping: float = 0.5     # damping [N·s/m]
+    stiffness: float = 20.0    # stiffness [N/m]
 
 @dataclass
 class SimConfig:
@@ -64,7 +64,7 @@ class MassSpringDamper:
         systems's derivate function: state y = [x, v] & y' = [v, a]
         """
         x, v = y                                            # unpack 2-element state array
-        m, c, k = self.p.m, self.p.c, self.p.k
+        m, c, k = self.p.mass, self.p.damping, self.p.stiffness
         a = (self.F(t) - c*v - k*x) / m                     # computes acceleration
         return np.array([v, a])
 
@@ -87,7 +87,7 @@ class MassSpringDamper:
         v = y[:, 1]
 
         # Energies
-        m, c, k = self.p.m, self.p.c, self.p.k
+        m, c, k = self.p.mass, self.p.damping, self.p.stiffness
         KE = 0.5 * m * v**2
         PE = 0.5 * k * x**2
         E = KE + PE
@@ -109,7 +109,7 @@ class MassSpringDamper:
         u = np.zeros(n)                                     # input force array
         r_hist = np.zeros(n)                                # reference signal (desired value) history
 
-        m, c, k = self.p.m, self.p.c, self.p.k
+        m, c, k = self.p.mass, self.p.damping, self.p.stiffness
         controller.reset()                                  # call reset method of the controller
 
         def f_with_u(_, y_local, u_k):
@@ -411,10 +411,11 @@ def plot_results(t, x, v, u, E, KE, PE):
     axs[3].legend()
     axs[3].grid(True, alpha=0.3)
 
-    zeta = c_to_zeta(params.c, params.m, params.k)
-    wn = np.sqrt(params.k / params.m)
+    # Use consistent MSDParams attribute names: mass, damping, stiffness
+    zeta = c_to_zeta(params.damping, params.mass, params.stiffness)
+    wn = np.sqrt(params.stiffness / params.mass) if params.mass != 0 else float('nan')
     fig.suptitle(f"Mass–Spring–Damper Response\n"
-                 f"m={params.m} kg, c={params.c} N·s/m, k={params.k} N/m, "
+                 f"m={params.mass} kg, c={params.damping} N·s/m, k={params.stiffness} N/m, "
                  f"ζ={zeta:.3f}, ωₙ={wn:.3f} rad/s")
     plt.tight_layout()
     plt.show()
@@ -452,10 +453,11 @@ def plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode, params):
     axs[4].legend()
     axs[4].grid(True, alpha=0.3)
 
-    zeta = c_to_zeta(params.c, params.m, params.k)
-    wn = np.sqrt(params.k / params.m)
+    # Use consistent MSDParams attribute names: mass, damping, stiffness
+    zeta = c_to_zeta(params.damping, params.mass, params.stiffness)
+    wn = np.sqrt(params.stiffness / params.mass) if params.mass != 0 else float('nan')
     fig.suptitle(f"Closed-loop MSD ({mode} control)\n"
-                 f"m={params.m} kg, c={params.c} N·s/m, k={params.k} N/m, "
+                 f"m={params.mass} kg, c={params.damping} N·s/m, k={params.stiffness} N/m, "
                  f"ζ={zeta:.3f}, ωₙ={wn:.3f} rad/s")
     plt.tight_layout()
     plt.show()
@@ -469,7 +471,7 @@ def c_to_zeta(c, m, k):
 
 if __name__ == "__main__":
     # System parameters
-    params = MSDParams(m=20.0, c=20.0, k=0.0)
+    params = MSDParams(mass=20.0, damping=20.0, stiffness=0.0)
 
     # Simulation config for RK4
     cfg = SimConfig(t0=0.0, tf=10.0, dt=0.001, x0=0.0, v0=0.0)
