@@ -293,13 +293,5 @@ README.md              # This documentation
 
 ## Contributing
 
-When contributing to this project, please:
-1. Follow the existing code style and documentation patterns
-2. Add appropriate docstrings to new functions and classes
-3. Include performance evaluation in new control algorithms
-4. Update README for significant feature additions
-5. Test with multiple system configurations and reference signals
 
 ## License
-
-This project is open source. Feel free to use and modify for educational and research purposes.
