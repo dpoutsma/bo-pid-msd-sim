@@ -23,7 +23,6 @@ from dataclasses import dataclass
 import numpy as np
 import matplotlib.pyplot as plt
 
-
 @dataclass
 class MSDParams:
     mass: float = 1.0     # mass [kg]
@@ -139,14 +138,15 @@ class MassSpringDamper:
 
         return t, x, v, u, E, KE, PE, r_hist
 
-    def simulate_cascade_loop(self, cfg: SimConfig, cascade_controller, ref_fn, use_feedforward=True):
+    def simulate_cascade_loop(self, cfg: SimConfig, cascade_controller, ref_fn, mode="position", use_feedforward=True):
         """
         Closed-loop simulation with cascade PID controller.
         
         Args:
             cfg: Simulation configuration
             cascade_controller: CascadePID instance
-            ref_fn: Position reference function
+            ref_fn: Reference function (position or velocity depending on mode)
+            mode: "position" for position control, "velocity" for direct velocity control
             use_feedforward: Whether to add external force as feedforward
             
         Returns:
@@ -161,7 +161,7 @@ class MassSpringDamper:
         # Arrays for logging
         u = np.zeros(n)                    # control force
         x_ref_hist = np.zeros(n)           # position reference history
-        v_ref_hist = np.zeros(n)           # velocity setpoint history (from outer loop)
+        v_ref_hist = np.zeros(n)           # velocity setpoint/reference history
         
         m, c, k = self.p.mass, self.p.damping, self.p.stiffness
         cascade_controller.reset()
@@ -174,14 +174,28 @@ class MassSpringDamper:
         
         for i in range(n - 1):
             x_i, v_i = y[i]
-            x_ref = ref_fn(t[i])
-            x_ref_hist[i] = x_ref
             
-            # Update cascade controller (returns force and intermediate velocity setpoint)
-            u_pid, v_setpoint = cascade_controller.update(
-                x_ref=x_ref, x_meas=x_i, v_meas=v_i, Ts=cfg.dt
-            )
-            v_ref_hist[i] = v_setpoint
+            if mode == "velocity":
+                # Direct velocity control mode
+                v_ref = ref_fn(t[i])
+                x_ref_hist[i] = float('nan')  # No position reference in this mode
+                
+                # Update cascade controller with direct velocity reference
+                u_pid, v_setpoint = cascade_controller.update(
+                    v_ref=v_ref, v_meas=v_i, Ts=cfg.dt
+                )
+                v_ref_hist[i] = v_setpoint  # Same as v_ref in this mode
+                
+            else:  # mode == "position" (default)
+                # Position control mode with cascade structure
+                x_ref = ref_fn(t[i])
+                x_ref_hist[i] = x_ref
+                
+                # Update cascade controller (returns force and intermediate velocity setpoint)
+                u_pid, v_setpoint = cascade_controller.update(
+                    x_ref=x_ref, x_meas=x_i, v_meas=v_i, Ts=cfg.dt
+                )
+                v_ref_hist[i] = v_setpoint
             
             # Add feedforward if specified
             u_ff = self.F(t[i]) if use_feedforward else 0.0
@@ -192,8 +206,12 @@ class MassSpringDamper:
             y[i+1] = rk4_step(f, t[i], y[i], cfg.dt)
         
         # Final values
-        x_ref_hist[-1] = ref_fn(t[-1])
-        v_ref_hist[-1] = v_ref_hist[-2]  # Use previous velocity setpoint
+        if mode == "velocity":
+            x_ref_hist[-1] = float('nan')
+            v_ref_hist[-1] = ref_fn(t[-1])
+        else:
+            x_ref_hist[-1] = ref_fn(t[-1])
+            v_ref_hist[-1] = v_ref_hist[-2]  # Use previous velocity setpoint
         u[-1] = u[-2]
         
         # Extract states and compute energies
@@ -276,10 +294,12 @@ class CascadePID:
     """
     Cascade PID controller with position outer loop and velocity inner loop.
     
-    The cascade structure is:
-    Position Reference -> [Outer PID] -> Velocity Setpoint -> [Inner PID] -> Force Output
-
-    This provides the possibility to tune position and velocity loops separately.
+    Two operating modes:
+    1. Position Reference -> [Outer PID] -> Velocity Setpoint -> [Inner PID] -> Force Output
+    2. Direct Velocity Reference -> [Inner PID] -> Force Output (position loop disabled)
+    
+    This provides the possibility to tune position and velocity loops separately,
+    or use direct velocity control when needed.
     """
     
     def __init__(self, 
@@ -312,27 +332,53 @@ class CascadePID:
         # Velocity saturation limits
         self.velocity_limit = velocity_limit
         
+        # Store original outer loop gains for enabling/disabling position loop
+        self.original_outer_gains = (outer_Kp, outer_Ki, outer_Kd)
+        
     def reset(self):
         """Reset both PID controllers"""
         self.outer_pid.reset()
         self.inner_pid.reset()
         
-    def update(self, x_ref, x_meas, v_meas, Ts):
+    def disable_position_loop(self):
+        """Disable position loop by setting all gains to zero"""
+        self.outer_pid.Kp = 0.0
+        self.outer_pid.Ki = 0.0 
+        self.outer_pid.Kd = 0.0
+        self.outer_pid.reset()  # Clear integrator and derivative states
+        
+    def enable_position_loop(self):
+        """Re-enable position loop with original gains"""
+        self.outer_pid.Kp, self.outer_pid.Ki, self.outer_pid.Kd = self.original_outer_gains
+        self.outer_pid.reset()  # Reset states when re-enabling
+        
+    def update(self, x_ref=None, x_meas=None, v_ref=None, v_meas=None, Ts=None):
         """
-        Update cascade controller.
+        Update cascade controller with flexible input modes.
+        
+        Two modes:
+        1. Position control: provide x_ref, x_meas, v_meas, Ts
+        2. Direct velocity control: provide v_ref, v_meas, Ts (x_ref, x_meas ignored)
         
         Args:
-            x_ref: Position reference/setpoint
-            x_meas: Measured position
-            v_meas: Measured velocity  
-            Ts: Sample time
+            x_ref: Position reference/setpoint (for position control mode)
+            x_meas: Measured position (for position control mode)
+            v_ref: Direct velocity reference (for velocity control mode)
+            v_meas: Measured velocity (required for both modes)
+            Ts: Sample time (required for both modes)
             
         Returns:
             u: Control force output
-            v_setpoint: Velocity setpoint from outer loop (for logging)
+            v_setpoint: Velocity setpoint used (from outer loop or direct reference)
         """
-        # Outer loop: position error -> velocity setpoint
-        v_setpoint = self.outer_pid.update(r=x_ref, y=x_meas, Ts=Ts)
+        if v_ref is not None:
+            # Direct velocity control mode - bypass position loop
+            v_setpoint = v_ref
+        elif x_ref is not None and x_meas is not None:
+            # Position control mode - use cascade structure
+            v_setpoint = self.outer_pid.update(r=x_ref, y=x_meas, Ts=Ts)
+        else:
+            raise ValueError("Must provide either (x_ref, x_meas) for position control or (v_ref) for velocity control")
         
         # Apply velocity limits if specified
         if self.velocity_limit is not None:
@@ -597,25 +643,35 @@ def plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode, params):
     plt.tight_layout()
     plt.show()
 
-def plot_cascade(t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist, params):
+def plot_cascade(t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist, params, mode="position"):
     """Plot results for cascade PID control showing both position and velocity loops"""
     fig, axs = plt.subplots(6, 1, figsize=(10, 14), sharex=True)
     
-    # Position tracking (outer loop)
-    axs[0].plot(t, x_ref_hist, 'r--', label="x* (position ref)")
-    axs[0].plot(t, x, 'b-', label="x (measured)")
-    axs[0].set_ylabel("Position [m]")
-    axs[0].legend()
-    axs[0].grid(True, alpha=0.3)
-    axs[0].set_title("Outer Loop: Position Control")
+    # Position tracking (outer loop) - skip if in velocity mode
+    if mode == "position" and not np.all(np.isnan(x_ref_hist)):
+        axs[0].plot(t, x_ref_hist, 'r--', label="x* (position ref)")
+        axs[0].plot(t, x, 'b-', label="x (measured)")
+        axs[0].set_ylabel("Position [m]")
+        axs[0].legend()
+        axs[0].grid(True, alpha=0.3)
+        axs[0].set_title("Outer Loop: Position Control")
+    else:
+        axs[0].plot(t, x, 'b-', label="x (position - not controlled)")
+        axs[0].set_ylabel("Position [m]")
+        axs[0].legend()
+        axs[0].grid(True, alpha=0.3)
+        axs[0].set_title("Position (Free Response)")
     
     # Velocity tracking (inner loop)
-    axs[1].plot(t, v_ref_hist, 'g--', label="v* (velocity setpoint)")
+    axs[1].plot(t, v_ref_hist, 'g--', label="v* (velocity reference)")
     axs[1].plot(t, v, 'b-', label="v (measured)")
     axs[1].set_ylabel("Velocity [m/s]")
     axs[1].legend()
     axs[1].grid(True, alpha=0.3)
-    axs[1].set_title("Inner Loop: Velocity Control")
+    if mode == "velocity":
+        axs[1].set_title("Direct Velocity Control")
+    else:
+        axs[1].set_title("Inner Loop: Velocity Control")
     
     # State plots
     axs[2].plot(t, x)
@@ -682,8 +738,8 @@ if __name__ == "__main__":
     evaluator = ControlEvaluator()
 
     # Choose what to run
-    # Set to "open-loop", "position", "velocity", "cascade", or "comparison"
-    run_mode = "cascade"  # Test cascade PID controller
+    # Set to "open-loop", "position", "velocity", "cascade", "velocity-setpoint", or "comparison"
+    run_mode = "velocity-setpoint"  # Test cascade PID controller
     
     # Initialize MSD
     msd = MassSpringDamper(params, force_fn=lambda t: 0.0)  # force is provided by the PID in closed-loop
@@ -747,9 +803,9 @@ if __name__ == "__main__":
         # Cascade PID control example
         ref_p = step_ref(magnitude=0.1, t_delay=0.5)
         t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist = msd.simulate_cascade_loop(
-            cfg, cascade_pid, ref_fn=ref_p, use_feedforward=False
+            cfg, cascade_pid, ref_fn=ref_p, mode="position", use_feedforward=False
         )
-        plot_cascade(t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist, params)
+        plot_cascade(t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist, params, mode="position")
         
         # Evaluate cascade controller performance (based on position tracking)
         metrics = evaluator.evaluate(
@@ -769,6 +825,35 @@ if __name__ == "__main__":
         print("\n=== CASCADE CONTROLLER INFO ===")
         print(f"Outer loop gains (position): Kp={cascade_pid.outer_pid.Kp}, Ki={cascade_pid.outer_pid.Ki}, Kd={cascade_pid.outer_pid.Kd}")
         print(f"Inner loop gains (velocity): Kp={cascade_pid.inner_pid.Kp}, Ki={cascade_pid.inner_pid.Ki}, Kd={cascade_pid.inner_pid.Kd}")
+        if cascade_pid.velocity_limit:
+            print(f"Velocity limits: {cascade_pid.velocity_limit} m/s")
+    
+    elif run_mode == "velocity-setpoint":
+        # Direct velocity setpoint control (bypass position loop)
+        ref_v = step_ref(magnitude=0.3, t_delay=1.0)  # 0.3 m/s step at t=1.0s
+        t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist = msd.simulate_cascade_loop(
+            cfg, cascade_pid, ref_fn=ref_v, mode="velocity", use_feedforward=False
+        )
+        plot_cascade(t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist, params, mode="velocity")
+        
+        # Evaluate velocity controller performance (based on velocity tracking)
+        metrics = evaluator.evaluate(
+            t=t,
+            y=v,  # velocity is the controlled variable
+            r=v_ref_hist,  # velocity reference
+            u=u, 
+            u_min=cascade_pid.inner_pid.u_min, 
+            u_max=cascade_pid.inner_pid.u_max
+        )
+        evaluator.print_metrics(metrics)
+        
+        # Plot error analysis for velocity tracking
+        error = v_ref_hist - v
+        evaluator.plot_error_analysis(t, v, v_ref_hist, error)
+        
+        print("\n=== DIRECT VELOCITY SETPOINT CONTROL ===")
+        print(f"Inner loop gains (velocity): Kp={cascade_pid.inner_pid.Kp}, Ki={cascade_pid.inner_pid.Ki}, Kd={cascade_pid.inner_pid.Kd}")
+        print("Position loop: DISABLED (direct velocity control)")
         if cascade_pid.velocity_limit:
             print(f"Velocity limits: {cascade_pid.velocity_limit} m/s")
     
