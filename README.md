@@ -265,6 +265,101 @@ The simulation includes a comprehensive `ControlEvaluator` class that automatica
 - **Cascade-specific plots**: Shows both position and velocity loop performance
 - **Formatted performance reports**: Automatic calculation and display of all metrics
 
+### Cost Aggregation for Optimization
+
+The `ControlEvaluator` includes a `cost_from_metrics()` method that aggregates per-scenario metrics into a scalar cost J for controller optimization (e.g., Bayesian optimization):
+
+**Pipeline**: `timeseries → metrics → normalized metrics → weighted sum → J`
+
+#### Cost Function
+For a given controller configuration φ, metrics from multiple scenarios are aggregated:
+
+**Mean Aggregator** (default):
+```
+J(φ) = (1/|S|) Σ [w_r·t̂_r + w_s·t̂_s + w_o·M̂_p + w_e·ŜSE]
+```
+
+**Worst-Case Aggregator** (robust):
+```
+J_wc(φ) = max [w_r·t̂_r + w_s·t̂_s + w_o·M̂_p + w_e·ŜSE]
+```
+
+Where:
+- `t̂_r`: Normalized rise time (10-90%)
+- `t̂_s`: Normalized settling time (2% band)
+- `M̂_p`: Normalized overshoot (%)
+- `ŜSE`: Normalized steady-state error
+- `w_r, w_s, w_o, w_e`: Weights reflecting mission priorities
+
+#### Default Configuration
+```python
+# Weights (should sum to 1.0)
+weights = {
+    'rise_time': 0.3,      # Fast response priority
+    'settling_time': 0.3,  # Stability priority
+    'overshoot': 0.2,      # Damping priority
+    'sse': 0.2            # Accuracy priority
+}
+
+# Normalization references
+normalization_refs = {
+    'rise_time': 1.0,      # 1 second
+    'settling_time': 5.0,  # 5 seconds
+    'overshoot': 20.0,     # 20%
+    'sse': 0.01           # 0.01 m or m/s
+}
+```
+
+#### Constraint Checking (Feasibility Gate)
+Candidates are **immediately rejected** with penalty `J = 1e6` if any scenario exhibits:
+
+1. **Numerical blow-up**: Energy divergence or NaN/Inf in metrics
+2. **Excessive actuator saturation**: Beyond specified percentage (default: 95%)
+3. **Position envelope violation**: Exceeds spatial bounds
+
+```python
+constraints = {
+    'max_saturation': 95.0,   # Max % saturation allowed
+    'max_energy': 1e6,        # Energy divergence threshold
+    'max_position': 100.0     # Position envelope limit [m]
+}
+```
+
+#### Usage Example
+```python
+evaluator = ControlEvaluator()
+metrics_list = []
+
+# Run multiple scenarios
+for scenario_ref, disturbance in test_scenarios:
+    system = MassSpringDamper(params, disturbance)
+    t, x, v, u, E, KE, PE, x_ref, v_ref = system.simulate_cascade_loop(
+        cfg, cascade_pid, ref_fn=scenario_ref, mode="position"
+    )
+    
+    # Compute metrics for this scenario
+    metrics = evaluator.evaluate(t, x, x_ref, u, u_min=-50, u_max=50)
+    metrics['max_energy'] = np.max(E)  # Add energy check
+    metrics['max_position'] = np.max(np.abs(x))  # Add position envelope
+    metrics_list.append(metrics)
+
+# Aggregate into scalar cost
+J = evaluator.cost_from_metrics(
+    metrics_list,
+    use_worst_case=False,  # Use mean aggregation
+    weights={'rise_time': 0.3, 'settling_time': 0.3, 'overshoot': 0.2, 'sse': 0.2},
+    constraints={'max_saturation': 90.0, 'max_energy': 1e5, 'max_position': 10.0}
+)
+
+print(f"Aggregate cost J = {J:.4f}")  # Lower is better
+```
+
+#### Applications
+- **Bayesian Optimization**: Use J as objective function for hyperparameter tuning
+- **Controller Benchmarking**: Compare different controller configurations
+- **Robust Design**: Use worst-case aggregator for conservative tuning
+- **Multi-Scenario Testing**: Ensure performance across diverse operating conditions
+
 ## Example Output
 
 ### Performance Metrics Display
