@@ -730,6 +730,136 @@ class ControlEvaluator:
         
         plt.tight_layout()
         plt.show()
+    
+    def cost_from_metrics(self, metrics_list, weights=None, use_worst_case=False, 
+                         normalization_refs=None, constraints=None):
+        """
+        Aggregates per-scenario metrics into a scalar cost J for optimization.
+        
+        Pipeline: timeseries → metrics → normalized metrics → weighted sum → J
+        
+        Args:
+            metrics_list: List of per-scenario metrics dictionaries from evaluate()
+            weights: Dict with keys {'rise_time', 'settling_time', 'overshoot', 'sse'} 
+                    Default: {'rise_time': 0.3, 'settling_time': 0.3, 'overshoot': 0.2, 'sse': 0.2}
+            use_worst_case: If True, use max aggregator (robust); if False, use mean aggregator
+            normalization_refs: Dict with reference values for normalization 
+                               Default: {'rise_time': 1.0, 'settling_time': 5.0, 'overshoot': 20.0, 'sse': 0.01}
+            constraints: Dict with constraint thresholds:
+                        {'max_saturation': 80.0,  # Max % saturation allowed
+                         'max_energy': 1000.0,    # Max energy allowed (divergence check)
+                         'max_position': 10.0}    # Position envelope limit
+                        
+        Returns:
+            float: Scalar cost J (lower is better). Returns large penalty if infeasible.
+        """
+        # Default weights (should sum to 1.0 for interpretability)
+        if weights is None:
+            weights = {
+                'rise_time': 0.3,      # w_r: Rise time weight
+                'settling_time': 0.3,  # w_s: Settling time weight
+                'overshoot': 0.2,      # w_o: Overshoot weight
+                'sse': 0.2            # w_e: Steady-state error weight
+            }
+        
+        # Default normalization references (typical good values)
+        if normalization_refs is None:
+            normalization_refs = {
+                'rise_time': 1.0,       # Normalize by 1 second
+                'settling_time': 5.0,   # Normalize by 5 seconds
+                'overshoot': 20.0,      # Normalize by 20% overshoot
+                'sse': 0.01            # Normalize by 1cm or 0.01 m/s
+            }
+        
+        # Default constraints (if None, no constraint checking)
+        if constraints is None:
+            constraints = {
+                'max_saturation': 95.0,   # Allow up to 95% saturation
+                'max_energy': 1e6,        # Energy divergence threshold
+                'max_position': 100.0     # Position envelope (very permissive)
+            }
+        
+        # Large penalty for infeasible solutions
+        INFEASIBLE_PENALTY = 1e6
+        
+        scenario_costs = []
+        
+        for i, metrics in enumerate(metrics_list):
+            # ===== Constraint Checking (Feasibility Gate) =====
+            
+            # Check for numerical divergence via energy (if available)
+            if 'max_energy' in metrics:
+                if metrics['max_energy'] > constraints['max_energy']:
+                    print(f"Scenario {i}: INFEASIBLE - Energy divergence ({metrics['max_energy']:.2e})")
+                    return INFEASIBLE_PENALTY
+            
+            # Check for NaN or Inf in critical metrics (numerical blow-up)
+            critical_keys = ['Rise time (10-90%)', 'Settling time (2%)', 'Steady-state error']
+            for key in critical_keys:
+                if key in metrics:
+                    val = metrics[key]
+                    if np.isnan(val) or np.isinf(val):
+                        print(f"Scenario {i}: INFEASIBLE - {key} is {val}")
+                        return INFEASIBLE_PENALTY
+            
+            # Check for excessive actuator saturation
+            if 'Total saturation (%)' in metrics:
+                if metrics['Total saturation (%)'] > constraints['max_saturation']:
+                    print(f"Scenario {i}: INFEASIBLE - Excessive saturation ({metrics['Total saturation (%)']:.1f}%)")
+                    return INFEASIBLE_PENALTY
+            
+            # Check for position envelope violation (if max_position tracked)
+            if 'max_position' in metrics:
+                if abs(metrics['max_position']) > constraints['max_position']:
+                    print(f"Scenario {i}: INFEASIBLE - Position envelope violation ({metrics['max_position']:.2f})")
+                    return INFEASIBLE_PENALTY
+            
+            # ===== Metric Extraction and Normalization =====
+            
+            # Extract and normalize rise time (t_r)
+            t_r = metrics.get('Rise time (10-90%)', float('nan'))
+            if np.isnan(t_r):
+                t_r = 10.0  # Pessimistic value if not computed
+            t_r_norm = t_r / normalization_refs['rise_time']
+            
+            # Extract and normalize settling time (t_s)
+            t_s = metrics.get('Settling time (2%)', float('nan'))
+            if np.isnan(t_s):
+                t_s = 20.0  # Pessimistic value if not computed
+            t_s_norm = t_s / normalization_refs['settling_time']
+            
+            # Extract and normalize overshoot (M_p)
+            M_p = metrics.get('Overshoot (%)', 0.0)
+            M_p_norm = M_p / normalization_refs['overshoot']
+            
+            # Extract and normalize steady-state error (SSE)
+            sse = metrics.get('Steady-state error', float('nan'))
+            if np.isnan(sse):
+                sse = 1.0  # Pessimistic value if not computed
+            sse_norm = sse / normalization_refs['sse']
+            
+            # ===== Weighted Cost Calculation =====
+            # J_s = w_r * t_r_norm + w_s * t_s_norm + w_o * M_p_norm + w_e * sse_norm
+            
+            cost_s = (
+                weights['rise_time'] * t_r_norm +
+                weights['settling_time'] * t_s_norm +
+                weights['overshoot'] * M_p_norm +
+                weights['sse'] * sse_norm
+            )
+            
+            scenario_costs.append(cost_s)
+        
+        # ===== Aggregation Across Scenarios =====
+        
+        if use_worst_case:
+            # Robust aggregator: J_wc = max over scenarios
+            J = np.max(scenario_costs)
+        else:
+            # Mean aggregator: J = mean over scenarios
+            J = np.mean(scenario_costs)
+        
+        return J
 
 def plot_results(t, x, v, u, E, KE, PE):
     fig, axs = plt.subplots(4, 1, figsize=(9, 10), sharex=True)
