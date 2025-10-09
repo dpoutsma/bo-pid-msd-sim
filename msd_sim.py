@@ -413,6 +413,166 @@ def chirp_force(A=1.0, f0=0.1, f1=5.0, tf=10.0):
 def step_ref(magnitude=0.1, t_delay=0.5):
     return lambda t: magnitude * (t >= t_delay)
 
+class Scenario:
+    """
+    Generates reference signals and disturbances for controller testing.
+    
+    Provides different test scenarios:
+    1. Steps and ramps (position and velocity)
+    2. Station-keeping (zero velocity reference) under disturbances
+    3. Straight-line cruise (constant velocity)
+    4. Path following: Combined maneuvers
+    """
+    
+    @staticmethod
+    def step_position(magnitude=0.1, t_start=0.5):
+        """Position step reference."""
+        return lambda t: magnitude * (t >= t_start)
+    
+    @staticmethod
+    def step_velocity(magnitude=0.05, t_start=0.5):
+        """Velocity step reference."""
+        return lambda t: magnitude * (t >= t_start)
+    
+    @staticmethod
+    def ramp_position(slope=0.02, t_start=0.5, t_end=None):
+        """Position ramp reference."""
+        def ramp(t):
+            if t < t_start:
+                return 0.0
+            elif t_end is not None and t >= t_end:
+                return slope * (t_end - t_start)
+            else:
+                return slope * (t - t_start)
+        return ramp
+    
+    @staticmethod
+    def ramp_velocity(slope=0.01, t_start=0.5, t_end=None):
+        """Velocity ramp reference."""
+        def ramp(t):
+            if t < t_start:
+                return 0.0
+            elif t_end is not None and t >= t_end:
+                return slope * (t_end - t_start)
+            else:
+                return slope * (t - t_start)
+        return ramp
+    
+    @staticmethod
+    def station_keeping(position=0.0):
+        """Station-keeping: maintain fixed position (zero velocity)."""
+        return lambda t: position
+    
+    @staticmethod
+    def cruise(velocity=0.05):
+        """Constant velocity cruise."""
+        return lambda t: velocity
+    
+    @staticmethod
+    def multi_step_position(steps, times):
+        """
+        Multiple position steps at different times.
+        
+        Args:
+            steps: List of step magnitudes
+            times: List of step times (must be same length as steps)
+        """
+        def multi_step(t):
+            value = 0.0
+            for magnitude, t_step in zip(steps, times):
+                if t >= t_step:
+                    value = magnitude
+            return value
+        return multi_step
+    
+    @staticmethod
+    def multi_step_velocity(steps, times):
+        """
+        Multiple velocity steps at different times.
+        
+        Args:
+            steps: List of step magnitudes
+            times: List of step times (must be same length as steps)
+        """
+        def multi_step(t):
+            value = 0.0
+            for magnitude, t_step in zip(steps, times):
+                if t >= t_step:
+                    value = magnitude
+            return value
+        return multi_step
+    
+    @staticmethod
+    def sinusoidal_position(amplitude=0.05, frequency=0.5, phase=0.0, offset=0.0):
+        """Sinusoidal position reference."""
+        omega = 2 * np.pi * frequency
+        return lambda t: offset + amplitude * np.sin(omega * t + phase)
+    
+    @staticmethod
+    def sinusoidal_velocity(amplitude=0.05, frequency=0.5, phase=0.0, offset=0.0):
+        """Sinusoidal velocity reference."""
+        omega = 2 * np.pi * frequency
+        return lambda t: offset + amplitude * np.sin(omega * t + phase)
+    
+    @staticmethod
+    def combined_maneuver(position_amplitude=0.1, velocity_offset=0.02, 
+                         frequency=0.3, t_transition=2.0):
+        """
+        Combined position and velocity maneuver.
+        First phase: position tracking with sinusoid
+        Second phase: velocity cruise
+        
+        Args:
+            position_amplitude: Amplitude of position sinusoid
+            velocity_offset: Constant velocity after transition
+            frequency: Frequency of position sinusoid
+            t_transition: Time to switch from position to velocity mode
+        """
+        omega = 2 * np.pi * frequency
+        def maneuver(t):
+            if t < t_transition:
+                return position_amplitude * np.sin(omega * t)
+            else:
+                # After transition, maintain the position reached
+                return position_amplitude * np.sin(omega * t_transition)
+        return maneuver
+    
+    @staticmethod
+    def disturbance_step(magnitude=1.0, t_start=2.0):
+        """Step disturbance force."""
+        return lambda t: magnitude * (t >= t_start)
+    
+    @staticmethod
+    def disturbance_impulse(area=1.0, t_impulse=2.0, width=0.01):
+        """Impulse disturbance (approximated as Gaussian)."""
+        sigma = width / 3.0
+        A = area / (np.sqrt(2 * np.pi) * sigma)
+        return lambda t: A * np.exp(-0.5 * ((t - t_impulse) / sigma)**2)
+    
+    @staticmethod
+    def disturbance_sinusoidal(amplitude=0.5, frequency=1.0):
+        """Sinusoidal disturbance force."""
+        omega = 2 * np.pi * frequency
+        return lambda t: amplitude * np.sin(omega * t)
+    
+    @staticmethod
+    def disturbance_random_walk(magnitude=0.1, seed=42):
+        """
+        Random walk disturbance (requires time array).
+        Returns a function that generates random values with memory.
+        """
+        rng = np.random.RandomState(seed)
+        state = {'last_t': -np.inf, 'value': 0.0}
+        
+        def random_disturbance(t):
+            # Update only if time has advanced
+            if t > state['last_t']:
+                state['value'] += rng.normal(0, magnitude)
+                state['last_t'] = t
+            return state['value']
+        
+        return random_disturbance
+
 class ControlEvaluator:
     """
     Calculates and displays performance metrics for controller evaluation.
