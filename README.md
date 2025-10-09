@@ -1,4 +1,3 @@
-
 # Mass–Spring–Damper System Simulation with PID Control
 
 This project simulates a **1-DOF mass–spring–damper (MSD) system** in Python, with support for open-loop, single-loop PID, and cascade PID control architectures.
