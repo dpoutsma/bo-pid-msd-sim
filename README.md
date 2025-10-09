@@ -118,6 +118,108 @@ ref = step_ref(magnitude=0.1, t_delay=0.5)
 ref = lambda t: 0.1 * np.sin(2*np.pi*0.5*t)  # Sinusoidal reference
 ```
 
+### Test Scenarios
+The `Scenario` class provides comprehensive reference signals and disturbances for systematic controller testing:
+
+#### 1. Steps and Ramps (Position and Velocity)
+```python
+# Position step
+ref = Scenario.step_position(magnitude=0.1, t_start=0.5)
+
+# Velocity step
+ref = Scenario.step_velocity(magnitude=0.05, t_start=0.5)
+
+# Position ramp
+ref = Scenario.ramp_position(slope=0.02, t_start=0.5, t_end=5.0)
+
+# Velocity ramp
+ref = Scenario.ramp_velocity(slope=0.01, t_start=0.5)
+
+# Multiple position steps
+ref = Scenario.multi_step_position(
+    steps=[0.05, 0.1, 0.15], 
+    times=[1.0, 3.0, 5.0]
+)
+```
+
+#### 2. Station-Keeping (with Disturbances)
+Test controller's ability to maintain position under external disturbances:
+```python
+# Station-keeping reference (maintain position at 0.0)
+ref = Scenario.station_keeping(position=0.0)
+
+# Add step disturbance
+disturbance = Scenario.disturbance_step(magnitude=5.0, t_start=2.0)
+
+# Add impulse disturbance
+disturbance = Scenario.disturbance_impulse(area=1.0, t_impulse=2.0, width=0.01)
+
+# Add sinusoidal disturbance
+disturbance = Scenario.disturbance_sinusoidal(amplitude=2.0, frequency=1.0)
+
+# Add random walk disturbance
+disturbance = Scenario.disturbance_random_walk(magnitude=0.1, seed=42)
+```
+
+#### 3. Straight-Line Cruise (Constant Velocity)
+```python
+# Constant velocity cruise
+ref = Scenario.cruise(velocity=0.05)
+```
+
+#### 4. Path Following: Combined Maneuvers
+```python
+# Sinusoidal position tracking
+ref = Scenario.sinusoidal_position(
+    amplitude=0.05, 
+    frequency=0.5, 
+    phase=0.0, 
+    offset=0.1
+)
+
+# Sinusoidal velocity tracking
+ref = Scenario.sinusoidal_velocity(
+    amplitude=0.05, 
+    frequency=0.5
+)
+
+# Combined maneuver (position tracking → velocity cruise)
+ref = Scenario.combined_maneuver(
+    position_amplitude=0.1,
+    velocity_offset=0.02,
+    frequency=0.3,
+    t_transition=2.0
+)
+```
+
+#### Example: Station-Keeping Under Disturbance
+```python
+# Configure system for station-keeping test
+params = MSDParams(mass=20.0, damping=20.0, stiffness=0.0)
+
+# Create disturbance force
+disturbance = Scenario.disturbance_step(magnitude=5.0, t_start=2.0)
+system = MassSpringDamper(params, disturbance)
+
+# Station-keeping reference
+ref = Scenario.station_keeping(position=0.0)
+
+# Simulate with cascade controller
+cascade_pid = CascadePID(
+    outer_Kp=50.0, outer_Ki=10.0, outer_Kd=5.0,
+    inner_Kp=100.0, inner_Ki=20.0, inner_Kd=2.0,
+    u_min=-50.0, u_max=50.0
+)
+
+t, x, v, u, E, KE, PE, x_ref, v_ref = system.simulate_cascade_loop(
+    cfg=SimConfig(tf=10.0, dt=0.001),
+    cascade_controller=cascade_pid,
+    ref_fn=ref,
+    mode="position",
+    use_feedforward=False  # Don't use disturbance as feedforward
+)
+```
+
 ## Cascade PID Control Architecture
 
 The cascade controller implements a dual-loop structure:
@@ -284,7 +386,8 @@ msd_sim.py              # Main simulation script
 ├── SimConfig           # Simulation configuration  
 ├── MassSpringDamper    # System dynamics and simulation methods
 ├── PID                 # Single-loop PID controller
-├── CascadePID          # Dual-loop cascade PID controller  
+├── CascadePID          # Dual-loop cascade PID controller
+├── Scenario            # Test scenarios and disturbances generator
 ├── ControlEvaluator    # Performance metrics and analysis
 └── Helper functions    # Reference signals, plotting, utilities
 requirements.txt        # Python dependencies
