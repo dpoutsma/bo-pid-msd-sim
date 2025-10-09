@@ -23,6 +23,16 @@ from dataclasses import dataclass
 import numpy as np
 import matplotlib.pyplot as plt
 
+try:
+    from bayes_opt import BayesianOptimization
+    from bayes_opt.logger import JSONLogger
+    from bayes_opt.event import Events
+    from bayes_opt.util import load_logs
+    BAYES_OPT_AVAILABLE = True
+except ImportError:
+    BAYES_OPT_AVAILABLE = False
+    print("Warning: bayesian-optimization not installed. Run: pip install bayesian-optimization")
+
 @dataclass
 class MSDParams:
     mass: float = 1.0     # mass [kg]
@@ -1346,8 +1356,8 @@ if __name__ == "__main__":
     evaluator = ControlEvaluator()
 
     # Choose what to run
-    # Set to "open-loop", "position", "velocity", "cascade", "velocity-setpoint", or "comparison"
-    run_mode = "velocity-setpoint"  # Test cascade PID controller
+    # Set to "open-loop", "position", "velocity", "cascade", "velocity-setpoint", "comparison", or "bayesian_optimization"
+    run_mode = "bayesian_optimization"
     
     # Initialize MSD
     msd = MassSpringDamper(params, force_fn=lambda t: 0.0)  # force is provided by the PID in closed-loop
@@ -1465,7 +1475,7 @@ if __name__ == "__main__":
         if cascade_pid.velocity_limit:
             print(f"Velocity limits: {cascade_pid.velocity_limit} m/s")
     
-    else:  # "comparison" or any other value - compare controllers
+    elif run_mode == "comparison":  # compare controllers
         # Run position control
         print("\n=== POSITION CONTROL TEST ===")
         ref_p = step_ref(magnitude=0.1, t_delay=0.5)
@@ -1501,3 +1511,444 @@ if __name__ == "__main__":
         # Plot error analysis for both controllers
         evaluator.plot_error_analysis(t_p, x_p, r_p, r_p - x_p)
         evaluator.plot_error_analysis(t_v, v_v, r_v, r_v - v_v)
+    
+    elif run_mode == "bayesian_optimization":
+        # ============================================================================
+        # BAYESIAN OPTIMIZATION FOR CASCADE PID TUNING
+        # ============================================================================
+        
+        if not BAYES_OPT_AVAILABLE:
+            print("ERROR: bayesian-optimization package not installed!")
+            print("Install with: pip install bayesian-optimization")
+            exit(1)
+        
+        print("\n" + "="*80)
+        print("BAYESIAN OPTIMIZATION FOR CASCADE PID TUNING")
+        print("="*80 + "\n")
+        
+        # ------------------------------------------------------------------------
+        # 1. DEFINE TEST SCENARIOS
+        # ------------------------------------------------------------------------
+        print("Setting up test scenarios...")
+        
+        # Create diverse test scenarios covering different maneuvers
+        test_scenarios = [
+            # Position control scenarios
+            (Scenario.step_position(magnitude=0.1, t_start=0.5), 
+             lambda t: 0.0, 
+             "position"),
+            
+            (Scenario.ramp_position(slope=0.05, t_start=0.5, t_end=5.0),
+             lambda t: 0.0,
+             "position"),
+            
+            (Scenario.multi_step_position([0.05, 0.15, 0.08], [0.5, 3.0, 6.0]),
+             lambda t: 0.0,
+             "position"),
+            
+            # Position control with disturbances
+            (Scenario.station_keeping(position=0.1),
+             Scenario.disturbance_step(magnitude=5.0, t_start=2.0),
+             "position"),
+            
+            (Scenario.step_position(magnitude=0.1, t_start=0.5),
+             Scenario.disturbance_sinusoidal(amplitude=2.0, frequency=0.5),
+             "position"),
+        ]
+        
+        print(f"  ✓ Created {len(test_scenarios)} test scenarios\n")
+        
+        # ------------------------------------------------------------------------
+        # 2. CONFIGURE BAYESIAN OPTIMIZATION
+        # ------------------------------------------------------------------------
+        
+        # Define log10 parameter bounds for each tuning stage
+        bounds_log10 = {
+            # Inner loop (velocity PI): tune first
+            'inner': {
+                'log10_Kp_v': [0.5, 3.0],   # Kp_v ∈ [3.16, 1000]
+                'log10_Ki_v': [-1.0, 2.0],  # Ki_v ∈ [0.1, 100]
+            },
+            # Outer loop (position PI): tune second with fixed inner loop
+            'outer': {
+                'log10_Kp_x': [0.0, 2.5],   # Kp_x ∈ [1, 316]
+                'log10_Ki_x': [-1.0, 2.0],  # Ki_x ∈ [0.1, 100]
+            },
+            # Joint optimization: fine-tune all four gains together
+            'joint': {
+                'log10_Kp_v': [0.5, 3.0],
+                'log10_Ki_v': [-1.0, 2.0],
+                'log10_Kp_x': [0.0, 2.5],
+                'log10_Ki_x': [-1.0, 2.0],
+            }
+        }
+        
+        # Cost function weights (prioritize fast settling and accuracy)
+        weights_cfg = {
+            'weights': {
+                'rise_time': 0.25,
+                'settling_time': 0.35,  # Prioritize stability
+                'overshoot': 0.20,
+                'sse': 0.20
+            },
+            'normalization_refs': {
+                'rise_time': 1.0,
+                'settling_time': 5.0,
+                'overshoot': 20.0,
+                'sse': 0.01
+            },
+            'use_worst_case': False  # Use mean aggregation
+        }
+        
+        # Safety constraints
+        safety_cfg = {
+            'max_saturation': 90.0,   # Allow up to 90% saturation
+            'max_energy': 1e5,        # Energy divergence threshold
+            'max_position': 5.0       # Position envelope [m]
+        }
+        
+        print("Configuration:")
+        print(f"  Weights: {weights_cfg['weights']}")
+        print(f"  Safety: max_sat={safety_cfg['max_saturation']}%, max_E={safety_cfg['max_energy']:.1e}, max_x={safety_cfg['max_position']}m")
+        print()
+        
+        # ------------------------------------------------------------------------
+        # 3. CREATE BOEvaluator
+        # ------------------------------------------------------------------------
+        
+        # Create fresh controller for optimization
+        opt_cascade_pid = CascadePID(
+            outer_Kp=10.0, outer_Ki=1.0, outer_Kd=0.0,  # Will be overwritten
+            inner_Kp=10.0, inner_Ki=1.0, inner_Kd=0.0,  # Will be overwritten
+            u_min=-50.0, u_max=50.0,
+            velocity_limit=(-2.0, 2.0)
+        )
+        
+        # Shorter simulation for optimization (faster evaluations)
+        opt_sim_cfg = SimConfig(t0=0.0, tf=8.0, dt=0.001, x0=0.0, v0=0.0)
+        
+        # Create BOEvaluator
+        bo_evaluator = BOEvaluator(
+            plant=msd,
+            controller=opt_cascade_pid,
+            evaluator=evaluator,
+            scenarios=test_scenarios,
+            bounds_log10=bounds_log10,
+            weights_cfg=weights_cfg,
+            safety_cfg=safety_cfg,
+            sim_cfg=opt_sim_cfg,
+            rng=np.random.RandomState(42)  # Reproducibility
+        )
+        
+        print("BOEvaluator created successfully\n")
+        
+        # ------------------------------------------------------------------------
+        # 4. STAGE 1: OPTIMIZE INNER LOOP (VELOCITY)
+        # ------------------------------------------------------------------------
+        print("="*80)
+        print("STAGE 1: INNER LOOP OPTIMIZATION (Velocity PI Gains)")
+        print("="*80 + "\n")
+        
+        bo_evaluator.set_stage('inner')
+        
+        # Manual seed points (good starting guesses in log10 space)
+        inner_seeds = [
+            {'log10_Kp_v': 2.0, 'log10_Ki_v': 1.0},   # Kp=100, Ki=10 (baseline)
+            {'log10_Kp_v': 1.5, 'log10_Ki_v': 0.5},   # Kp=31.6, Ki=3.16
+            {'log10_Kp_v': 2.3, 'log10_Ki_v': 1.3},   # Kp=200, Ki=20
+        ]
+        
+        # Create Bayesian Optimization object for inner loop
+        # Note: We maximize -J (negative cost) since BO maximizes
+        inner_optimizer = BayesianOptimization(
+            f=bo_evaluator,  # Callable that returns -J
+            pbounds=bounds_log10['inner'],
+            random_state=42,
+            allow_duplicate_points=False
+        )
+        
+        # Configure Gaussian Process (Matérn kernel with ν=2.5)
+        from sklearn.gaussian_process.kernels import Matern
+        inner_optimizer.set_gp_params(
+            kernel=Matern(nu=2.5, length_scale=[1.0, 1.0], length_scale_bounds=[(0.1, 10.0), (0.1, 10.0)]),
+            alpha=1e-4,  # Noise level (small for deterministic sims)
+            n_restarts_optimizer=5
+        )
+        
+        # Add manual seed points
+        print("Probing manual seed points...")
+        for i, seed in enumerate(inner_seeds):
+            try:
+                inner_optimizer.probe(params=seed, lazy=False)
+                print(f"  Seed {i+1}/{len(inner_seeds)} evaluated")
+            except Exception as e:
+                print(f"  Seed {i+1} failed: {e}")
+        
+        print()
+        
+        # Run Bayesian Optimization
+        print("Running Bayesian Optimization...")
+        print(f"  Initial random points: 5")
+        print(f"  Optimization iterations: 25")
+        print()
+        
+        inner_optimizer.maximize(
+            init_points=5,      # Additional random initialization
+            n_iter=25,          # Number of BO iterations
+            acq='ei',           # Expected Improvement
+            xi=0.01            # Small exploration parameter
+        )
+        
+        # Extract best inner loop gains
+        best_inner = inner_optimizer.max
+        best_inner_gains = {
+            'Kp_v': 10 ** best_inner['params']['log10_Kp_v'],
+            'Ki_v': 10 ** best_inner['params']['log10_Ki_v']
+        }
+        
+        print("\n" + "-"*80)
+        print(f"STAGE 1 COMPLETE")
+        print(f"Best Inner Loop Gains: Kp_v={best_inner_gains['Kp_v']:.2f}, Ki_v={best_inner_gains['Ki_v']:.2f}")
+        print(f"Best Cost J: {-best_inner['target']:.6f}")
+        print("-"*80 + "\n")
+        
+        # Fix inner loop gains for next stage
+        opt_cascade_pid.set_inner_gains(best_inner_gains['Kp_v'], best_inner_gains['Ki_v'])
+        
+        # ------------------------------------------------------------------------
+        # 5. STAGE 2: OPTIMIZE OUTER LOOP (POSITION)
+        # ------------------------------------------------------------------------
+        print("="*80)
+        print("STAGE 2: OUTER LOOP OPTIMIZATION (Position PI Gains)")
+        print("="*80 + "\n")
+        
+        bo_evaluator.set_stage('outer')
+        
+        # Manual seed points for outer loop
+        outer_seeds = [
+            {'log10_Kp_x': 1.7, 'log10_Ki_x': 1.0},   # Kp=50, Ki=10 (baseline)
+            {'log10_Kp_x': 1.3, 'log10_Ki_x': 0.7},   # Kp=20, Ki=5
+            {'log10_Kp_x': 2.0, 'log10_Ki_x': 1.3},   # Kp=100, Ki=20
+        ]
+        
+        # Create optimizer for outer loop
+        outer_optimizer = BayesianOptimization(
+            f=bo_evaluator,
+            pbounds=bounds_log10['outer'],
+            random_state=43,
+            allow_duplicate_points=False
+        )
+        
+        # Configure GP
+        outer_optimizer.set_gp_params(
+            kernel=Matern(nu=2.5, length_scale=[1.0, 1.0], length_scale_bounds=[(0.1, 10.0), (0.1, 10.0)]),
+            alpha=1e-4,
+            n_restarts_optimizer=5
+        )
+        
+        # Probe seed points
+        print("Probing manual seed points...")
+        for i, seed in enumerate(outer_seeds):
+            try:
+                outer_optimizer.probe(params=seed, lazy=False)
+                print(f"  Seed {i+1}/{len(outer_seeds)} evaluated")
+            except Exception as e:
+                print(f"  Seed {i+1} failed: {e}")
+        
+        print()
+        
+        # Run optimization
+        print("Running Bayesian Optimization...")
+        print(f"  Initial random points: 5")
+        print(f"  Optimization iterations: 25")
+        print()
+        
+        outer_optimizer.maximize(
+            init_points=5,
+            n_iter=25,
+            acq='ei',
+            xi=0.01
+        )
+        
+        # Extract best outer loop gains
+        best_outer = outer_optimizer.max
+        best_outer_gains = {
+            'Kp_x': 10 ** best_outer['params']['log10_Kp_x'],
+            'Ki_x': 10 ** best_outer['params']['log10_Ki_x']
+        }
+        
+        print("\n" + "-"*80)
+        print(f"STAGE 2 COMPLETE")
+        print(f"Best Outer Loop Gains: Kp_x={best_outer_gains['Kp_x']:.2f}, Ki_x={best_outer_gains['Ki_x']:.2f}")
+        print(f"Best Cost J: {-best_outer['target']:.6f}")
+        print("-"*80 + "\n")
+        
+        # Fix outer loop gains for next stage
+        opt_cascade_pid.set_outer_gains(best_outer_gains['Kp_x'], best_outer_gains['Ki_x'])
+        
+        # ------------------------------------------------------------------------
+        # 6. STAGE 3: JOINT OPTIMIZATION (FINE-TUNING)
+        # ------------------------------------------------------------------------
+        print("="*80)
+        print("STAGE 3: JOINT OPTIMIZATION (All Four PI Gains)")
+        print("="*80 + "\n")
+        
+        bo_evaluator.set_stage('joint')
+        
+        # Seed with best from previous stages
+        joint_seeds = [
+            {
+                'log10_Kp_v': best_inner['params']['log10_Kp_v'],
+                'log10_Ki_v': best_inner['params']['log10_Ki_v'],
+                'log10_Kp_x': best_outer['params']['log10_Kp_x'],
+                'log10_Ki_x': best_outer['params']['log10_Ki_x']
+            },
+        ]
+        
+        # Create optimizer for joint optimization
+        joint_optimizer = BayesianOptimization(
+            f=bo_evaluator,
+            pbounds=bounds_log10['joint'],
+            random_state=44,
+            allow_duplicate_points=False
+        )
+        
+        # Configure GP (4D now)
+        joint_optimizer.set_gp_params(
+            kernel=Matern(nu=2.5, length_scale=[1.0]*4, length_scale_bounds=[(0.1, 10.0)]*4),
+            alpha=1e-4,
+            n_restarts_optimizer=5
+        )
+        
+        # Probe seed point
+        print("Probing best from previous stages...")
+        for i, seed in enumerate(joint_seeds):
+            try:
+                joint_optimizer.probe(params=seed, lazy=False)
+                print(f"  Seed {i+1}/{len(joint_seeds)} evaluated")
+            except Exception as e:
+                print(f"  Seed {i+1} failed: {e}")
+        
+        print()
+        
+        # Run joint optimization (fewer iterations since 4D is more expensive)
+        print("Running Joint Bayesian Optimization...")
+        print(f"  Initial random points: 8")
+        print(f"  Optimization iterations: 30")
+        print()
+        
+        joint_optimizer.maximize(
+            init_points=8,
+            n_iter=30,
+            acq='ei',
+            xi=0.02  # Slightly more exploration in higher dimensions
+        )
+        
+        # Extract best joint gains
+        best_joint = joint_optimizer.max
+        best_joint_gains = {
+            'Kp_v': 10 ** best_joint['params']['log10_Kp_v'],
+            'Ki_v': 10 ** best_joint['params']['log10_Ki_v'],
+            'Kp_x': 10 ** best_joint['params']['log10_Kp_x'],
+            'Ki_x': 10 ** best_joint['params']['log10_Ki_x']
+        }
+        
+        print("\n" + "-"*80)
+        print(f"STAGE 3 COMPLETE")
+        print(f"Best Joint Gains:")
+        print(f"  Inner: Kp_v={best_joint_gains['Kp_v']:.2f}, Ki_v={best_joint_gains['Ki_v']:.2f}")
+        print(f"  Outer: Kp_x={best_joint_gains['Kp_x']:.2f}, Ki_x={best_joint_gains['Ki_x']:.2f}")
+        print(f"Best Cost J: {-best_joint['target']:.6f}")
+        print("-"*80 + "\n")
+        
+        # ------------------------------------------------------------------------
+        # 7. SUMMARY AND CONVERGENCE PLOTS
+        # ------------------------------------------------------------------------
+        print("="*80)
+        print("OPTIMIZATION SUMMARY")
+        print("="*80 + "\n")
+        
+        bo_evaluator.print_best()
+        
+        # Plot convergence for each stage
+        fig, axs = plt.subplots(3, 1, figsize=(10, 10))
+        
+        # Inner loop convergence
+        inner_targets = [-res['target'] for res in inner_optimizer.res]  # Convert back to J (cost)
+        axs[0].plot(inner_targets, 'b-o', markersize=4)
+        axs[0].axhline(y=min(inner_targets), color='r', linestyle='--', label=f'Best J={min(inner_targets):.4f}')
+        axs[0].set_ylabel('Cost J')
+        axs[0].set_title('Stage 1: Inner Loop (Velocity) Convergence')
+        axs[0].grid(True, alpha=0.3)
+        axs[0].legend()
+        
+        # Outer loop convergence
+        outer_targets = [-res['target'] for res in outer_optimizer.res]
+        axs[1].plot(outer_targets, 'g-o', markersize=4)
+        axs[1].axhline(y=min(outer_targets), color='r', linestyle='--', label=f'Best J={min(outer_targets):.4f}')
+        axs[1].set_ylabel('Cost J')
+        axs[1].set_title('Stage 2: Outer Loop (Position) Convergence')
+        axs[1].grid(True, alpha=0.3)
+        axs[1].legend()
+        
+        # Joint optimization convergence
+        joint_targets = [-res['target'] for res in joint_optimizer.res]
+        axs[2].plot(joint_targets, 'm-o', markersize=4)
+        axs[2].axhline(y=min(joint_targets), color='r', linestyle='--', label=f'Best J={min(joint_targets):.4f}')
+        axs[2].set_ylabel('Cost J')
+        axs[2].set_xlabel('Iteration')
+        axs[2].set_title('Stage 3: Joint Optimization Convergence')
+        axs[2].grid(True, alpha=0.3)
+        axs[2].legend()
+        
+        plt.tight_layout()
+        plt.savefig('bo_convergence.png', dpi=150, bbox_inches='tight')
+        print("Convergence plot saved to: bo_convergence.png\n")
+        plt.show()
+        
+        # ------------------------------------------------------------------------
+        # 8. FINAL VALIDATION
+        # ------------------------------------------------------------------------
+        print("="*80)
+        print("FINAL VALIDATION ON TEST SCENARIO")
+        print("="*80 + "\n")
+        
+        # Apply best gains to a fresh controller
+        final_cascade_pid = CascadePID(
+            outer_Kp=best_joint_gains['Kp_x'],
+            outer_Ki=best_joint_gains['Ki_x'],
+            outer_Kd=0.0,
+            inner_Kp=best_joint_gains['Kp_v'],
+            inner_Ki=best_joint_gains['Ki_v'],
+            inner_Kd=0.0,
+            u_min=-50.0, u_max=50.0,
+            velocity_limit=(-2.0, 2.0)
+        )
+        
+        # Run a longer validation simulation
+        val_cfg = SimConfig(t0=0.0, tf=15.0, dt=0.001, x0=0.0, v0=0.0)
+        ref_val = Scenario.multi_step_position([0.0, 0.15, 0.05, 0.2], [0.0, 2.0, 6.0, 10.0])
+        
+        t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist = msd.simulate_cascade_loop(
+            cfg=val_cfg,
+            cascade_controller=final_cascade_pid,
+            ref_fn=ref_val,
+            mode="position",
+            use_feedforward=False
+        )
+        
+        # Evaluate performance
+        val_metrics = evaluator.evaluate(
+            t=t, y=x, r=x_ref_hist, u=u,
+            u_min=final_cascade_pid.inner_pid.u_min,
+            u_max=final_cascade_pid.inner_pid.u_max
+        )
+        
+        evaluator.print_metrics(val_metrics)
+        
+        # Plot validation results
+        plot_cascade(t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist, params, mode="position")
+        
+        print("\n" + "="*80)
+        print("BAYESIAN OPTIMIZATION COMPLETE!")
+        print("="*80 + "\n")
