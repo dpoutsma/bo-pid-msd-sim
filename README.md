@@ -291,7 +291,7 @@ Where:
 - `ŜSE`: Normalized steady-state error
 - `w_r, w_s, w_o, w_e`: Weights reflecting mission priorities
 
-#### Default Configuration
+#### Default Configuration (Defined in BOEvaluator)
 ```python
 # Weights (should sum to 1.0)
 weights = {
@@ -310,20 +310,7 @@ normalization_refs = {
 }
 ```
 
-#### Constraint Checking (Feasibility Gate)
-Candidates are **immediately rejected** with penalty `J = 1e6` if any scenario exhibits:
-
-1. **Numerical blow-up**: Energy divergence or NaN/Inf in metrics
-2. **Excessive actuator saturation**: Beyond specified percentage (default: 95%)
-3. **Position envelope violation**: Exceeds spatial bounds
-
-```python
-constraints = {
-    'max_saturation': 95.0,   # Max % saturation allowed
-    'max_energy': 1e6,        # Energy divergence threshold
-    'max_position': 100.0     # Position envelope limit [m]
-}
-```
+**Note**: `cost_from_metrics()` requires `weights` and `normalization_refs` to be explicitly passed (no defaults). The `BOEvaluator` class is the single source of truth for these configuration values.
 
 #### Usage Example
 ```python
@@ -339,16 +326,15 @@ for scenario_ref, disturbance in test_scenarios:
     
     # Compute metrics for this scenario
     metrics = evaluator.evaluate(t, x, x_ref, u, u_min=-50, u_max=50)
-    metrics['max_energy'] = np.max(E)  # Add energy check
-    metrics['max_position'] = np.max(np.abs(x))  # Add position envelope
     metrics_list.append(metrics)
 
 # Aggregate into scalar cost
+# Note: Must explicitly provide weights and normalization_refs
 J = evaluator.cost_from_metrics(
     metrics_list,
-    use_worst_case=False,  # Use mean aggregation
     weights={'rise_time': 0.3, 'settling_time': 0.3, 'overshoot': 0.2, 'sse': 0.2},
-    constraints={'max_saturation': 90.0, 'max_energy': 1e5, 'max_position': 10.0}
+    normalization_refs={'rise_time': 1.0, 'settling_time': 5.0, 'overshoot': 20.0, 'sse': 0.01},
+    use_worst_case=False  # Use mean aggregation
 )
 
 print(f"Aggregate cost J = {J:.4f}")  # Lower is better
@@ -389,6 +375,45 @@ Max control rate:   2.156e+04
 - **System Response**: Displacement, velocity, control force, and energy plots
 - **Reference Tracking**: Comparison of setpoint vs. actual response
 - **Cascade Visualization**: Dual-loop controller with position and velocity references
+- **Error Analysis**: Dedicated plots for tracking error evaluation
+
+## Bayesian Optimization for PID Tuning
+
+The `BOEvaluator` class provides a complete framework for automated PID tuning using Bayesian Optimization. It manages multi-stage tuning, constraint checking, and provides a clean interface for optimization libraries.
+
+### Architecture: Separation of Concerns
+
+**BOEvaluator** (Constraint Checking & Safety):
+- Performs **early-exit** constraint checking during simulation
+- Prevents unnecessary computation for infeasible candidates
+- Handles: energy divergence, actuator saturation, position envelope, NaN/Inf detection
+- Returns large penalty (`1e6`) for constraint violations
+
+**ControlEvaluator** (Pure Metric Aggregation):
+- Purely focused on metric normalization and cost calculation
+- NO constraint checking - assumes feasible inputs
+- Converts multi-scenario metrics into scalar cost `J`
+
+This design eliminates redundancy while maintaining safety through early exits in `BOEvaluator._run_scenarios()`.
+
+### Constraint Checking (Safety Configuration)
+
+Candidates are **immediately rejected** during simulation if any scenario exhibits:
+
+1. **Numerical blow-up**: Energy divergence or NaN/Inf in metrics
+2. **Excessive actuator saturation**: Beyond specified percentage (default: 95%)
+3. **Position envelope violation**: Exceeds spatial bounds
+
+```python
+safety_cfg = {
+    'max_saturation': 95.0,   # Max % saturation allowed
+    'max_energy': 1e6,        # Energy divergence threshold
+    'max_position': 100.0     # Position envelope limit [m]
+}
+```
+
+These checks happen in `BOEvaluator._run_scenarios()` **before** calling `cost_from_metrics()`, preventing wasted computation on infeasible solutions.
+
 - **Error Analysis**: Dedicated plots for tracking error evaluation
 
 ## Mathematical Background

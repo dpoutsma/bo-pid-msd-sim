@@ -351,6 +351,14 @@ class CascadePID:
         """Re-enable position loop with original gains"""
         self.outer_pid.Kp, self.outer_pid.Ki, self.outer_pid.Kd = self.original_outer_gains
         self.outer_pid.reset()  # Reset states when re-enabling
+    
+    def set_outer_gains(self, Kp_x, Ki_x):
+        """Set outer loop (position) PI gains for Bayesian Optimization"""
+        self.outer_pid.Kp, self.outer_pid.Ki = Kp_x, Ki_x
+    
+    def set_inner_gains(self, Kp_v, Ki_v):
+        """Set inner loop (velocity) PI gains for Bayesian Optimization"""
+        self.inner_pid.Kp, self.inner_pid.Ki = Kp_v, Ki_v
         
     def update(self, x_ref=None, x_meas=None, v_ref=None, v_meas=None, Ts=None):
         """
@@ -731,89 +739,30 @@ class ControlEvaluator:
         plt.tight_layout()
         plt.show()
     
-    def cost_from_metrics(self, metrics_list, weights=None, use_worst_case=False, 
-                         normalization_refs=None, constraints=None):
+    def cost_from_metrics(self, metrics_list, weights, normalization_refs, use_worst_case=False):
         """
         Aggregates per-scenario metrics into a scalar cost J for optimization.
         
         Pipeline: timeseries → metrics → normalized metrics → weighted sum → J
         
+        This method is purely about metric aggregation and does NOT perform constraint
+        checking. Constraint validation should be done upstream (e.g., in BOEvaluator).
+        
         Args:
             metrics_list: List of per-scenario metrics dictionaries from evaluate()
             weights: Dict with keys {'rise_time', 'settling_time', 'overshoot', 'sse'} 
-                    Default: {'rise_time': 0.3, 'settling_time': 0.3, 'overshoot': 0.2, 'sse': 0.2}
+                    (REQUIRED - no defaults, caller must provide)
+            normalization_refs: Dict with reference values for normalization
+                               (REQUIRED - no defaults, caller must provide)
             use_worst_case: If True, use max aggregator (robust); if False, use mean aggregator
-            normalization_refs: Dict with reference values for normalization 
-                               Default: {'rise_time': 1.0, 'settling_time': 5.0, 'overshoot': 20.0, 'sse': 0.01}
-            constraints: Dict with constraint thresholds:
-                        {'max_saturation': 80.0,  # Max % saturation allowed
-                         'max_energy': 1000.0,    # Max energy allowed (divergence check)
-                         'max_position': 10.0}    # Position envelope limit
                         
         Returns:
-            float: Scalar cost J (lower is better). Returns large penalty if infeasible.
+            float: Scalar cost J (lower is better)
         """
-        # Default weights (should sum to 1.0 for interpretability)
-        if weights is None:
-            weights = {
-                'rise_time': 0.3,      # w_r: Rise time weight
-                'settling_time': 0.3,  # w_s: Settling time weight
-                'overshoot': 0.2,      # w_o: Overshoot weight
-                'sse': 0.2            # w_e: Steady-state error weight
-            }
-        
-        # Default normalization references (typical good values)
-        if normalization_refs is None:
-            normalization_refs = {
-                'rise_time': 1.0,       # Normalize by 1 second
-                'settling_time': 5.0,   # Normalize by 5 seconds
-                'overshoot': 20.0,      # Normalize by 20% overshoot
-                'sse': 0.01            # Normalize by 1cm or 0.01 m/s
-            }
-        
-        # Default constraints (if None, no constraint checking)
-        if constraints is None:
-            constraints = {
-                'max_saturation': 95.0,   # Allow up to 95% saturation
-                'max_energy': 1e6,        # Energy divergence threshold
-                'max_position': 100.0     # Position envelope (very permissive)
-            }
-        
-        # Large penalty for infeasible solutions
-        INFEASIBLE_PENALTY = 1e6
         
         scenario_costs = []
         
         for i, metrics in enumerate(metrics_list):
-            # ===== Constraint Checking (Feasibility Gate) =====
-            
-            # Check for numerical divergence via energy (if available)
-            if 'max_energy' in metrics:
-                if metrics['max_energy'] > constraints['max_energy']:
-                    print(f"Scenario {i}: INFEASIBLE - Energy divergence ({metrics['max_energy']:.2e})")
-                    return INFEASIBLE_PENALTY
-            
-            # Check for NaN or Inf in critical metrics (numerical blow-up)
-            critical_keys = ['Rise time (10-90%)', 'Settling time (2%)', 'Steady-state error']
-            for key in critical_keys:
-                if key in metrics:
-                    val = metrics[key]
-                    if np.isnan(val) or np.isinf(val):
-                        print(f"Scenario {i}: INFEASIBLE - {key} is {val}")
-                        return INFEASIBLE_PENALTY
-            
-            # Check for excessive actuator saturation
-            if 'Total saturation (%)' in metrics:
-                if metrics['Total saturation (%)'] > constraints['max_saturation']:
-                    print(f"Scenario {i}: INFEASIBLE - Excessive saturation ({metrics['Total saturation (%)']:.1f}%)")
-                    return INFEASIBLE_PENALTY
-            
-            # Check for position envelope violation (if max_position tracked)
-            if 'max_position' in metrics:
-                if abs(metrics['max_position']) > constraints['max_position']:
-                    print(f"Scenario {i}: INFEASIBLE - Position envelope violation ({metrics['max_position']:.2f})")
-                    return INFEASIBLE_PENALTY
-            
             # ===== Metric Extraction and Normalization =====
             
             # Extract and normalize rise time (t_r)
@@ -860,6 +809,375 @@ class ControlEvaluator:
             J = np.mean(scenario_costs)
         
         return J
+
+class BOEvaluator:
+    """
+    Bayesian Optimization Evaluator for multi-stage PID tuning.
+    
+    Manages the evaluation of controller candidates across multiple scenarios,
+    implements constraint checking, and provides a callable interface for
+    Bayesian optimization libraries.
+    
+    Supports three tuning stages:
+    - 'inner': Tune velocity loop (inner) PI gains only
+    - 'outer': Tune position loop (outer) PI gains only (with fixed inner gains)
+    - 'joint': Tune all four PI gains simultaneously
+    """
+    
+    def __init__(self, plant, controller, evaluator, scenarios, bounds_log10, 
+                 weights_cfg=None, safety_cfg=None, sim_cfg=None, rng=None):
+        """
+        Initialize Bayesian Optimization Evaluator.
+        
+        Args:
+            plant: MassSpringDamper instance (the system to control)
+            controller: CascadePID instance (the controller to tune)
+            evaluator: ControlEvaluator instance (for computing metrics)
+            scenarios: List of scenario tuples: [(ref_fn, disturbance_fn, mode), ...]
+                      Each tuple contains (reference_function, disturbance_function, control_mode)
+            bounds_log10: Dict of log10 parameter bounds per stage:
+                         {
+                             'inner': {'log10_Kp_v': [a, b], 'log10_Ki_v': [c, d]},
+                             'outer': {'log10_Kp_x': [e, f], 'log10_Ki_x': [g, h]},
+                             'joint': {'log10_Kp_v': [...], 'log10_Ki_v': [...],
+                                      'log10_Kp_x': [...], 'log10_Ki_x': [...]}
+                         }
+            weights_cfg: Dict with cost function configuration:
+                        {
+                            'weights': {'rise_time': 0.3, 'settling_time': 0.3, ...},
+                            'normalization_refs': {'rise_time': 1.0, ...},
+                            'use_worst_case': False
+                        }
+            safety_cfg: Dict with constraint thresholds:
+                       {
+                           'max_saturation': 95.0,
+                           'max_energy': 1e6,
+                           'max_position': 100.0
+                       }
+            sim_cfg: SimConfig instance for simulation settings
+            rng: Random number generator (for reproducibility)
+        """
+        self.plant = plant
+        self.controller = controller
+        self.evaluator = evaluator
+        self.scenarios = scenarios
+        self.bounds_log10 = bounds_log10
+        self.sim_cfg = sim_cfg if sim_cfg is not None else SimConfig(tf=10.0, dt=0.001)
+        self.rng = rng if rng is not None else np.random.RandomState(42)
+        
+        # Default weights configuration
+        if weights_cfg is None:
+            weights_cfg = {
+                'weights': {
+                    'rise_time': 0.3,
+                    'settling_time': 0.3,
+                    'overshoot': 0.2,
+                    'sse': 0.2
+                },
+                'normalization_refs': {
+                    'rise_time': 1.0,
+                    'settling_time': 5.0,
+                    'overshoot': 20.0,
+                    'sse': 0.01
+                },
+                'use_worst_case': False
+            }
+        self.weights_cfg = weights_cfg
+        
+        # Default safety configuration
+        if safety_cfg is None:
+            safety_cfg = {
+                'max_saturation': 95.0,
+                'max_energy': 1e6,
+                'max_position': 100.0
+            }
+        self.safety_cfg = safety_cfg
+        
+        # Store best results per stage
+        self.best = {
+            'inner': {'J': float('inf'), 'gains': None, 'metrics': None},
+            'outer': {'J': float('inf'), 'gains': None, 'metrics': None},
+            'joint': {'J': float('inf'), 'gains': None, 'metrics': None}
+        }
+        
+        # Current tuning stage
+        self.current_stage = None
+        
+        # Evaluation counter
+        self.eval_count = 0
+    
+    def set_stage(self, stage):
+        """
+        Set the current tuning stage.
+        
+        Args:
+            stage: 'inner', 'outer', or 'joint'
+        """
+        if stage not in ['inner', 'outer', 'joint']:
+            raise ValueError(f"Invalid stage '{stage}'. Must be 'inner', 'outer', or 'joint'.")
+        self.current_stage = stage
+    
+    def _log10_to_gains(self, **log10_params):
+        """
+        Convert log10 parameters to actual gains.
+        
+        Args:
+            **log10_params: Keyword arguments with log10 parameter values
+                          (e.g., log10_Kp_v=1.5, log10_Ki_v=0.8)
+        
+        Returns:
+            dict: Actual gain values {'Kp_v': ..., 'Ki_v': ..., 'Kp_x': ..., 'Ki_x': ...}
+        """
+        gains = {}
+        
+        # Map log10 parameters to actual gains
+        for param_name, log10_value in log10_params.items():
+            if param_name.startswith('log10_'):
+                gain_name = param_name[6:]  # Remove 'log10_' prefix
+                gains[gain_name] = 10 ** log10_value
+        
+        return gains
+    
+    def _apply_gains(self, gains):
+        """
+        Apply gains to the controller based on current stage.
+        
+        Args:
+            gains: Dict with gain values {'Kp_v': ..., 'Ki_v': ..., 'Kp_x': ..., 'Ki_x': ...}
+        """
+        # Apply inner loop gains if available
+        if 'Kp_v' in gains and 'Ki_v' in gains:
+            self.controller.set_inner_gains(gains['Kp_v'], gains['Ki_v'])
+        
+        # Apply outer loop gains if available
+        if 'Kp_x' in gains and 'Ki_x' in gains:
+            self.controller.set_outer_gains(gains['Kp_x'], gains['Ki_x'])
+    
+    def _run_scenarios(self):
+        """
+        Run all scenarios and collect metrics.
+        
+        Returns:
+            tuple: (metrics_list, all_feasible)
+                  - metrics_list: List of metric dicts for each scenario
+                  - all_feasible: Boolean indicating if all scenarios were feasible
+        """
+        metrics_list = []
+        all_feasible = True
+        
+        for i, (ref_fn, disturbance_fn, mode) in enumerate(self.scenarios):
+            # Update plant with disturbance
+            self.plant.F = disturbance_fn
+            
+            # Run simulation
+            try:
+                t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist = self.plant.simulate_cascade_loop(
+                    cfg=self.sim_cfg,
+                    cascade_controller=self.controller,
+                    ref_fn=ref_fn,
+                    mode=mode,
+                    use_feedforward=False
+                )
+            except Exception as e:
+                print(f"Scenario {i}: SIMULATION FAILED - {str(e)}")
+                all_feasible = False
+                return None, False
+            
+            # Choose appropriate reference and output based on mode
+            if mode == "velocity":
+                y = v
+                r = v_ref_hist
+            else:  # position mode
+                y = x
+                r = x_ref_hist
+            
+            # Compute metrics
+            metrics = self.evaluator.evaluate(
+                t=t, y=y, r=r, u=u,
+                u_min=self.controller.inner_pid.u_min,
+                u_max=self.controller.inner_pid.u_max
+            )
+            
+            # Add energy and position envelope metrics
+            metrics['max_energy'] = np.max(E)
+            metrics['max_position'] = np.max(np.abs(x))
+            
+            # Early exit checks (per-scenario safety)
+            if metrics['max_energy'] > self.safety_cfg['max_energy']:
+                print(f"Scenario {i}: EARLY EXIT - Energy divergence ({metrics['max_energy']:.2e})")
+                all_feasible = False
+                return None, False
+            
+            if metrics['Total saturation (%)'] > self.safety_cfg['max_saturation']:
+                print(f"Scenario {i}: EARLY EXIT - Excessive saturation ({metrics['Total saturation (%)']:.1f}%)")
+                all_feasible = False
+                return None, False
+            
+            if metrics['max_position'] > self.safety_cfg['max_position']:
+                print(f"Scenario {i}: EARLY EXIT - Position envelope violation ({metrics['max_position']:.2f})")
+                all_feasible = False
+                return None, False
+            
+            # Check for NaN/Inf in critical metrics
+            for key in ['Rise time (10-90%)', 'Settling time (2%)', 'Steady-state error']:
+                if key in metrics:
+                    if np.isnan(metrics[key]) or np.isinf(metrics[key]):
+                        print(f"Scenario {i}: EARLY EXIT - {key} is {metrics[key]}")
+                        all_feasible = False
+                        return None, False
+            
+            metrics_list.append(metrics)
+        
+        return metrics_list, all_feasible
+    
+    def __call__(self, **log10_params):
+        """
+        Evaluate a candidate controller configuration.
+        
+        This method is called by the Bayesian Optimization library.
+        
+        Args:
+            **log10_params: Log10-scaled parameters (e.g., log10_Kp_v=1.5, log10_Ki_v=0.8)
+        
+        Returns:
+            float: Negative cost J (for maximization by BO library)
+                  Returns large negative value for infeasible candidates
+        """
+        self.eval_count += 1
+        
+        # Convert log10 parameters to actual gains
+        gains = self._log10_to_gains(**log10_params)
+        
+        # Apply gains to controller
+        self._apply_gains(gains)
+        
+        # Reset controller state
+        self.controller.reset()
+        
+        # Run all scenarios
+        metrics_list, feasible = self._run_scenarios()
+        
+        # Handle infeasible cases
+        if not feasible or metrics_list is None:
+            J = 1e6  # Large penalty
+            print(f"Eval {self.eval_count}: INFEASIBLE - J={J:.2e}")
+            return -J  # Return negative for maximization
+        
+        # Compute aggregate cost (no constraint checking here - done upstream in _run_scenarios)
+        J = self.evaluator.cost_from_metrics(
+            metrics_list,
+            weights=self.weights_cfg['weights'],
+            normalization_refs=self.weights_cfg['normalization_refs'],
+            use_worst_case=self.weights_cfg.get('use_worst_case', False)
+        )
+        
+        # Update best if improved
+        if self.current_stage and J < self.best[self.current_stage]['J']:
+            self.best[self.current_stage]['J'] = J
+            self.best[self.current_stage]['gains'] = gains.copy()
+            self.best[self.current_stage]['metrics'] = metrics_list
+            print(f"Eval {self.eval_count}: NEW BEST for '{self.current_stage}' - J={J:.4f}, gains={gains}")
+        else:
+            print(f"Eval {self.eval_count}: J={J:.4f}, gains={gains}")
+        
+        # Return negative cost for maximization (BO maximizes the objective)
+        return -J
+    
+    def evaluate_with_breakdown(self, **log10_params):
+        """
+        Evaluate a candidate and return detailed breakdown.
+        
+        Args:
+            **log10_params: Log10-scaled parameters
+        
+        Returns:
+            tuple: (J, breakdown, feasible)
+                  - J: Scalar cost
+                  - breakdown: Dict with per-scenario costs and metrics
+                  - feasible: Boolean indicating feasibility
+        """
+        # Convert log10 parameters to actual gains
+        gains = self._log10_to_gains(**log10_params)
+        
+        # Apply gains to controller
+        self._apply_gains(gains)
+        
+        # Reset controller state
+        self.controller.reset()
+        
+        # Run all scenarios
+        metrics_list, feasible = self._run_scenarios()
+        
+        # Handle infeasible cases
+        if not feasible or metrics_list is None:
+            J = 1e6
+            breakdown = {'feasible': False, 'reason': 'Early exit due to safety constraint'}
+            return J, breakdown, False
+        
+        # Compute aggregate cost (no constraint checking here - done upstream in _run_scenarios)
+        J = self.evaluator.cost_from_metrics(
+            metrics_list,
+            weights=self.weights_cfg['weights'],
+            normalization_refs=self.weights_cfg['normalization_refs'],
+            use_worst_case=self.weights_cfg.get('use_worst_case', False)
+        )
+        
+        # Build breakdown
+        breakdown = {
+            'feasible': True,
+            'J': J,
+            'gains': gains,
+            'metrics_list': metrics_list,
+            'num_scenarios': len(metrics_list)
+        }
+        
+        return J, breakdown, True
+    
+    def get_bounds(self, stage=None):
+        """
+        Get parameter bounds for the specified stage.
+        
+        Args:
+            stage: 'inner', 'outer', or 'joint'. If None, uses current_stage.
+        
+        Returns:
+            dict: Parameter bounds for BayesianOptimization library
+        """
+        if stage is None:
+            stage = self.current_stage
+        
+        if stage not in self.bounds_log10:
+            raise ValueError(f"No bounds defined for stage '{stage}'")
+        
+        return self.bounds_log10[stage]
+    
+    def print_best(self, stage=None):
+        """
+        Print the best result for a given stage.
+        
+        Args:
+            stage: 'inner', 'outer', or 'joint'. If None, prints all stages.
+        """
+        if stage is None:
+            stages = ['inner', 'outer', 'joint']
+        else:
+            stages = [stage]
+        
+        print("\n" + "="*60)
+        print("BEST RESULTS FROM BAYESIAN OPTIMIZATION")
+        print("="*60)
+        
+        for s in stages:
+            best = self.best[s]
+            if best['gains'] is not None:
+                print(f"\n--- Stage: {s.upper()} ---")
+                print(f"Best Cost J: {best['J']:.6f}")
+                print(f"Best Gains: {best['gains']}")
+            else:
+                print(f"\n--- Stage: {s.upper()} ---")
+                print("No evaluations completed yet.")
+        
+        print("\n" + "="*60 + "\n")
 
 def plot_results(t, x, v, u, E, KE, PE):
     fig, axs = plt.subplots(4, 1, figsize=(9, 10), sharex=True)
