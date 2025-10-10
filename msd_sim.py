@@ -835,7 +835,7 @@ class BOEvaluator:
     """
     
     def __init__(self, plant, controller, evaluator, scenarios, bounds_log10, 
-                 weights_cfg=None, safety_cfg=None, sim_cfg=None, rng=None):
+                 weights_cfg, safety_cfg, sim_cfg=None, rng=None):
         """
         Initialize Bayesian Optimization Evaluator.
         
@@ -852,56 +852,30 @@ class BOEvaluator:
                              'joint': {'log10_Kp_v': [...], 'log10_Ki_v': [...],
                                       'log10_Kp_x': [...], 'log10_Ki_x': [...]}
                          }
-            weights_cfg: Dict with cost function configuration:
+            weights_cfg: Dict with cost function configuration (REQUIRED):
                         {
                             'weights': {'rise_time': 0.3, 'settling_time': 0.3, ...},
                             'normalization_refs': {'rise_time': 1.0, ...},
                             'use_worst_case': False
                         }
-            safety_cfg: Dict with constraint thresholds:
+            safety_cfg: Dict with constraint thresholds (REQUIRED):
                        {
                            'max_saturation': 95.0,
                            'max_energy': 1e6,
                            'max_position': 100.0
                        }
-            sim_cfg: SimConfig instance for simulation settings
-            rng: Random number generator (for reproducibility)
+            sim_cfg: SimConfig instance for simulation settings (optional)
+            rng: Random number generator (for reproducibility, optional)
         """
         self.plant = plant
         self.controller = controller
         self.evaluator = evaluator
         self.scenarios = scenarios
         self.bounds_log10 = bounds_log10
+        self.weights_cfg = weights_cfg
+        self.safety_cfg = safety_cfg
         self.sim_cfg = sim_cfg if sim_cfg is not None else SimConfig(tf=10.0, dt=0.001)
         self.rng = rng if rng is not None else np.random.RandomState(42)
-        
-        # Default weights configuration
-        if weights_cfg is None:
-            weights_cfg = {
-                'weights': {
-                    'rise_time': 0.3,
-                    'settling_time': 0.3,
-                    'overshoot': 0.2,
-                    'sse': 0.2
-                },
-                'normalization_refs': {
-                    'rise_time': 1.0,
-                    'settling_time': 5.0,
-                    'overshoot': 20.0,
-                    'sse': 0.01
-                },
-                'use_worst_case': False
-            }
-        self.weights_cfg = weights_cfg
-        
-        # Default safety configuration
-        if safety_cfg is None:
-            safety_cfg = {
-                'max_saturation': 95.0,
-                'max_energy': 1e6,
-                'max_position': 100.0
-            }
-        self.safety_cfg = safety_cfg
         
         # Store best results per stage
         self.best = {
@@ -1513,9 +1487,7 @@ if __name__ == "__main__":
         evaluator.plot_error_analysis(t_v, v_v, r_v, r_v - v_v)
     
     elif run_mode == "bayesian_optimization":
-        # ============================================================================
         # BAYESIAN OPTIMIZATION FOR CASCADE PID TUNING
-        # ============================================================================
         
         if not BAYES_OPT_AVAILABLE:
             print("ERROR: bayesian-optimization package not installed!")
@@ -1526,12 +1498,9 @@ if __name__ == "__main__":
         print("BAYESIAN OPTIMIZATION FOR CASCADE PID TUNING")
         print("="*80 + "\n")
         
-        # ------------------------------------------------------------------------
         # 1. DEFINE TEST SCENARIOS
-        # ------------------------------------------------------------------------
         print("Setting up test scenarios...")
         
-        # Create diverse test scenarios covering different maneuvers
         test_scenarios = [
             # Position control scenarios
             (Scenario.step_position(magnitude=0.1, t_start=0.5), 
@@ -1558,11 +1527,8 @@ if __name__ == "__main__":
         
         print(f"  ✓ Created {len(test_scenarios)} test scenarios\n")
         
-        # ------------------------------------------------------------------------
         # 2. CONFIGURE BAYESIAN OPTIMIZATION
-        # ------------------------------------------------------------------------
         
-        # Define log10 parameter bounds for each tuning stage
         bounds_log10 = {
             # Inner loop (velocity PI): tune first
             'inner': {
