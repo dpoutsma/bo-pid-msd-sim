@@ -1,3 +1,4 @@
+
 # Mass–Spring–Damper System Simulation with PID Control
 
 This project simulates a **1-DOF mass–spring–damper (MSD) system** in Python, with support for open-loop, single-loop PID, and cascade PID control architectures.
@@ -67,9 +68,52 @@ Edit the `run_mode` variable in the main block of `msd_sim.py` to select:
 - **`"open-loop"`**: Open-loop simulation with predetermined force input
 - **`"position"`**: Single-loop PID position control
 - **`"velocity"`**: Single-loop PID velocity control  
-- **`"cascade"`**: Cascade PID with position reference (outer loop controls position → inner loop controls velocity)
+- **`"cascade"`**: Cascade PID testing with easy mode switching (see Cascade Mode Testing below)
 - **`"velocity-setpoint"`**: Direct velocity setpoint control (bypass position loop)
 - **`"comparison"`**: Compare multiple controllers side-by-side
+- **`"bayesian_optimization"`**: Automated PID tuning using Bayesian Optimization
+
+### Cascade Mode Testing
+
+The cascade mode includes a convenient `TEST_MODE` variable for easy switching between testing scenarios:
+
+```python
+run_mode = "cascade"
+
+# Change this single line to switch test scenarios:
+TEST_MODE = "velocity"  # Options: "velocity" or "position"
+```
+
+**Velocity Mode** (Inner Loop Only):
+- Tests inner velocity loop with outer position loop disabled
+- Two built-in scenarios (uncomment to switch):
+  - **Cruise + Disturbance** (default): Station-keeping with impulse disturbance
+  - **Velocity Step**: Step tracking performance
+
+**Position Mode** (Full Cascade):
+- Tests complete cascade system with both loops active
+- Two built-in scenarios (uncomment to switch):
+  - **Position Step** (default): Step tracking with both loops
+  - **Position + Disturbance**: Step with external disturbance
+
+**Example**:
+```python
+# Test velocity disturbance rejection
+TEST_MODE = "velocity"
+reference = Scenario.cruise(velocity=0.0)
+disturbance = Scenario.disturbance_impulse(area=1.0, t_impulse=2.0, width=0.01)
+
+# Test position tracking  
+TEST_MODE = "position"
+reference = Scenario.step_position(magnitude=0.1, t_start=0.5)
+disturbance = lambda t: 0.0
+```
+
+The code automatically:
+- ✅ Sets correct control mode
+- ✅ Selects appropriate controlled variable (velocity or position)
+- ✅ Configures reference and disturbance
+- ✅ Updates plots and performance output
 
 ### System Parameters
 Configure the mass-spring-damper system in the `MSDParams` class:
@@ -80,6 +124,28 @@ params = MSDParams(
     stiffness=0.0     # Spring stiffness [N/m]
 )
 ```
+
+### Simulation Configuration
+
+```python
+cfg = SimConfig(
+    t0=0.0,      # Start time [s]
+    tf=10.0,     # End time [s]
+    dt=0.05,     # Time step [s] - affects stability limits!
+    x0=0.0,      # Initial position [m]
+    v0=0.0       # Initial velocity [m/s]
+)
+```
+
+**Important**: The time step `dt` affects discrete-time stability:
+- **Testing/validation**: Use `dt=0.001` (1ms) for high-fidelity simulation
+- **Bayesian optimization**: Use `dt=0.05` (50ms) for faster evaluations
+- **Stability impact**: Larger `dt` reduces stability margins (see stability analysis in cascade mode)
+
+For the MSD system with `dt=0.05s`:
+- Velocity loop stable up to: `Ki ≈ 79,000` (Nyquist limit)
+- Recommended max gains reduced from `dt=0.001` limits
+- Trade-off: 50× faster simulations vs. reduced stability margins
 
 ### Controller Tuning
 #### Single PID Controller
@@ -159,6 +225,21 @@ disturbance = Scenario.disturbance_sinusoidal(amplitude=2.0, frequency=1.0)
 # Add random walk disturbance
 disturbance = Scenario.disturbance_random_walk(magnitude=0.1, seed=42)
 ```
+
+**Important**: To apply disturbances to the system dynamics, use `use_feedforward=True` in simulation:
+
+```python
+# Apply disturbance to system
+msd.F = disturbance
+
+# Enable feedforward to add disturbance force to dynamics
+t, x, v, u, E, KE, PE, x_ref, v_ref = msd.simulate_cascade_loop(
+    cfg, cascade_pid, ref_fn=ref, mode="position",
+    use_feedforward=True  # Critical: enables disturbance application
+)
+```
+
+**Note**: If `use_feedforward=False` (default for some modes), the disturbance is ignored even if set. Always use `True` when testing disturbance rejection.
 
 #### 3. Straight-Line Cruise (Constant Velocity)
 ```python
@@ -248,10 +329,38 @@ The simulation includes a comprehensive `ControlEvaluator` class that automatica
 - **RMSE (Root Mean Square Error)**: `√(1/N ∑e²)` - Quantifies error magnitude variations
 
 ### Dynamic Response Analysis
+
+The evaluator automatically detects the reference type and applies appropriate metric calculations:
+
+#### Step Response Metrics (for step references)
 - **Rise Time (10-90%)**: Time to transition from 10% to 90% of final value
 - **Settling Time (2%)**: Time to settle and remain within 2% of final value
 - **Overshoot**: Maximum excursion beyond setpoint as percentage
 - **Steady-state Error**: Average tracking error in final 10% of simulation
+
+#### Disturbance Response Metrics (for constant references)
+
+For station-keeping and cruise scenarios with disturbances, specialized metrics measure disturbance rejection performance:
+
+- **Rise Time (10-90%)**: Time to recover from peak error to 10% of peak (90% recovery)
+- **Settling Time (2%)**: Time to reduce error to 2% of peak and maintain it
+- **Peak Deviation**: Maximum error during disturbance as percentage of setpoint
+- **Steady-state Error**: Residual error after disturbance rejection
+
+**Key Features**:
+- Automatic detection of constant vs. step references
+- Disturbance detection threshold: 0.001 (detects even well-controlled disturbances)
+- Normalized metrics relative to peak disturbance magnitude
+- Returns NaN if no significant disturbance detected (max error < 0.001)
+
+Example output for disturbance rejection:
+```
+--- Dynamic Response ---
+Rise time (10-90%): 5.179 s    # Time to 90% recovery from peak
+Settling time (2%): 8.587 s    # Time to 2% of peak and stable
+Overshoot:          34.61 %    # Peak deviation from setpoint
+Steady-state error: 2.17e-07   # Final residual error
+```
 
 ### Constraint Analysis  
 - **Control Saturation**: Percentage of time at upper/lower control limits
@@ -412,6 +521,132 @@ safety_cfg = {
 ```
 
 These checks happen in `BOEvaluator._run_scenarios()` **before** calling `cost_from_metrics()`, preventing wasted computation on infeasible solutions.
+
+### Finding Appropriate Gain Bounds
+
+Before running Bayesian Optimization, it's crucial to determine reasonable bounds for the gain search space. Using the **cascade mode test** (`run_mode = "cascade"`), you can empirically test different gain combinations to understand stability boundaries and performance characteristics.
+
+#### Recommended Gain Bounds (Empirically Determined)
+
+For the MSD system with `m=20kg`, `c=20 N·s/m`, `k=0 N/m`:
+
+```python
+bounds_log10 = {
+    # Inner loop (velocity PI): tune first
+    'inner': {
+        'log10_Kp_v': [-1.0, 4.0],   # Kp_v ∈ [0.1, 10000]
+        'log10_Ki_v': [-1.0, 4.0],   # Ki_v ∈ [0.1, 10000]
+    },
+    # Outer loop (position PI): tune second with fixed inner loop
+    'outer': {
+        'log10_Kp_x': [-1.0, 3.0],   # Kp_x ∈ [0.1, 1000]
+        'log10_Ki_x': [-10.0, 2.0],  # Ki_x ∈ [1e-10, 100]
+    },
+}
+```
+
+#### How to Find These Bounds
+
+**Step 1: Test Individual Loops in Cascade Mode**
+
+Set `run_mode = "cascade"` and configure `TEST_MODE`:
+
+```python
+# Test velocity loop (inner loop)
+TEST_MODE = "velocity"  # Isolates inner loop
+
+# Test different gain combinations
+cascade_pid = CascadePID(
+    outer_Kp=50.0, outer_Ki=10.0, outer_Kd=0.0,    # Disabled in velocity mode
+    inner_Kp=100.0, inner_Ki=50.0, inner_Kd=0.0,   # Active - test these!
+    u_min=-50.0, u_max=50.0,
+    velocity_limit=(-2.0, 2.0)
+)
+```
+
+**Step 2: Vary Gains Systematically**
+
+Test gains across multiple orders of magnitude:
+- Very low: `Kp=0.1, Ki=0.1` (too slow)
+- Low: `Kp=10, Ki=10` (slow response)
+- Moderate: `Kp=100, Ki=50` (good balance)
+- High: `Kp=1000, Ki=500` (aggressive)
+- Very high: `Kp=10000, Ki=5000` (oscillatory/unstable)
+
+**Step 3: Identify Stability Boundaries**
+
+Run the test and observe:
+- **Stable region**: Metrics compute successfully, J is finite
+- **Marginally stable**: High oscillations, large overshoot
+- **Unstable**: NaN metrics, saturation > 90%, position divergence
+
+**Step 4: Set Conservative Bounds**
+
+- **Lower bound**: Just above where response becomes too slow (high J)
+- **Upper bound**: Well below instability threshold (safety margin)
+
+**Example findings for inner loop (velocity)**:
+- Stable up to: `Kp ≈ 1000, Ki ≈ 180` (oscillation boundary)
+- Instability beyond: `Ki > 79,000` (Nyquist limit with dt=0.05s)
+- **Recommended bounds**: `Kp ∈ [0.1, 10000], Ki ∈ [0.1, 10000]`
+
+**Step 5: Repeat for Outer Loop**
+
+```python
+# Test position loop (outer loop)
+TEST_MODE = "position"  # Full cascade
+
+# With fixed, well-tuned inner loop
+cascade_pid = CascadePID(
+    outer_Kp=50.0, outer_Ki=10.0, outer_Kd=0.0,    # Test these!
+    inner_Kp=100.0, inner_Ki=50.0, inner_Kd=0.0,   # Fixed from Step 1
+    ...
+)
+```
+
+The outer loop is **more sensitive** to instability due to cascade coupling. Use more conservative bounds.
+
+#### Notes on Bound Selection
+
+1. **Logarithmic space**: Search in `log10(gain)` for uniform exploration across orders of magnitude
+2. **Safety margins**: Keep upper bounds 2-5× below observed instability
+3. **Ki lower bound**: Can be very small (1e-10) to allow pure P control
+4. **System-dependent**: These bounds are specific to the MSD parameters used
+
+### Optimization Strategy: Sequential Two-Stage Approach
+
+The current implementation uses a **sequential optimization** strategy rather than joint optimization:
+
+**Stage 1: Inner Loop (Velocity PI)**
+- Optimize `Kp_v` and `Ki_v` with outer loop disabled
+- Test scenarios: velocity steps, cruise with disturbances
+- Fix best inner gains before proceeding
+
+**Stage 2: Outer Loop (Position PI)**  
+- Optimize `Kp_x` and `Ki_x` with fixed inner loop
+- Test scenarios: position steps, multi-steps
+- Inner loop gains remain fixed at Stage 1 optimum
+
+**Benefits of Sequential Approach**:
+- ✅ Faster convergence (2D search vs 4D)
+- ✅ Better exploration with fewer iterations
+- ✅ Follows cascade tuning best practices (inner first, then outer)
+- ✅ Easier to interpret results and debug issues
+
+**Note**: A Stage 3 joint optimization (all 4 gains simultaneously) is available but commented out in the code, as sequential optimization typically provides sufficient results with much lower computational cost.
+
+### Convergence Visualization
+
+Bayesian Optimization convergence plots automatically filter extreme cost values for better visualization:
+
+```python
+# Y-axis limited to [0, 5] to focus on useful range
+# Extreme outliers (J > 5) are clipped but still in data
+axs[0].set_ylim([0, 5])  # Inner loop convergence
+axs[1].set_ylim([0, 5])  # Outer loop convergence
+```
+
+This prevents infeasible candidates with very high costs (J > 100) from dominating the plot scale, making it easier to see the optimization trend in the feasible region.
 
 - **Error Analysis**: Dedicated plots for tracking error evaluation
 

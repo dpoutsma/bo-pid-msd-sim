@@ -25,13 +25,11 @@ import matplotlib.pyplot as plt
 
 try:
     from bayes_opt import BayesianOptimization
-    from bayes_opt.logger import JSONLogger
-    from bayes_opt.event import Events
-    from bayes_opt.util import load_logs
     BAYES_OPT_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     BAYES_OPT_AVAILABLE = False
-    print("Warning: bayesian-optimization not installed. Run: pip install bayesian-optimization")
+    print(f"Warning: bayesian-optimization import failed: {e}")
+    print("Run: pip install bayesian-optimization")
 
 @dataclass
 class MSDParams:
@@ -43,7 +41,7 @@ class MSDParams:
 class SimConfig:
     t0: float = 0.0
     tf: float = 10.0
-    dt: float = 0.001
+    dt: float = 0.05
     x0: float = 0.0     # initial displacement [m]
     v0: float = 0.0     # initial velocity [m/s]
 
@@ -54,7 +52,7 @@ def rk4_step(f, t, y, h):
     """
     k1 = f(t, y)
     k2 = f(t + 0.5*h, y + 0.5*h*k1)
-    k3 = f(t + 0.5*h, y + 0.5*h*k2)
+    k3 = f(t + 0.5*h, y + 0.5*h+k2)
     k4 = f(t + h,     y + h*k3)
     return y + (h/6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
@@ -602,13 +600,14 @@ class ControlEvaluator:
     """
     def __init__(self):
         pass
-    
+
     def evaluate(self, t, y, r, u, u_min, u_max, eps=0.02, final_pct=10):
+
         """
         Evaluates controller performance based on time series data.
-        
+
         Args:
-            t: Array of time points
+        t: Array of time points
             y: Array of measured outputs (position or velocity)
             r: Array of reference signals (setpoints)
             u: Array of control inputs
@@ -616,6 +615,7 @@ class ControlEvaluator:
             eps: Settling band tolerance (default: 2%)
             final_pct: Percentage of final points to use for steady-state calculation (default: 10%)
         """
+
         # Calculate error and time step
         e = r - y
         dt = t[1] - t[0] if len(t) > 1 else 0.001
@@ -640,41 +640,104 @@ class ControlEvaluator:
         
         # ===== Dynamic Response =====
         
-        # Only for step references
-        if np.all(r == r[0]) or np.all(r[r>0] == r[np.where(r>0)[0][0]]):
-            # Get step characteristics
-            r_final = r[-1]  # Final reference value
-            r_step = r_final - r[0]  # Step size
+        # Detect reference type: constant vs step
+        r_unique = np.unique(r)
+        is_constant = len(r_unique) == 1  # Only one unique value
+        is_step = len(r_unique) == 2 and np.sum(np.abs(np.diff(r)) > 1e-6) == 1  # Two values, one transition
+        
+        if is_step:
+            # STEP RESPONSE ANALYSIS
+            r_initial = r[0]
+            r_final = r[-1]
+            r_step = r_final - r_initial
             
-            if abs(r_step) > 1e-6:  # Only if we have a significant step
-                # Rise time calculation (10% to 90%)
-                y_norm = (y - y[0]) / r_step
+            # Find step transition point
+            step_idx = np.where(np.abs(np.diff(r)) > 1e-6)[0][0] + 1
+            t_step = t[step_idx]
+            
+            # Rise time calculation (10% to 90% of step)
+            y_norm = (y - r_initial) / r_step
+            try:
+                t_10 = t[np.where(y_norm >= 0.1)[0][0]]
+                t_90 = t[np.where(y_norm >= 0.9)[0][0]]
+                metrics['Rise time (10-90%)'] = t_90 - t_10
+            except IndexError:
+                metrics['Rise time (10-90%)'] = float('nan')
+
+            # Overshoot
+            if r_step > 0:
+                overshoot = (np.max(y) - r_final) / abs(r_final) * 100 if abs(r_final) > 1e-6 else 0
+            else:
+                overshoot = (r_final - np.min(y)) / abs(r_final) * 100 if abs(r_final) > 1e-6 else 0
+            metrics['Overshoot (%)'] = max(0, overshoot)
+
+            # Settling time (2% band around final value)
+            settling_threshold = eps * abs(r_final) if abs(r_final) > 1e-6 else eps * abs(r_step)
+            settled = np.where(np.abs(e) <= settling_threshold)[0]
+            if len(settled) > 0:
+                # Find first point that stays settled
+                for idx in settled:
+                    if np.all(np.abs(e[idx:]) <= settling_threshold):
+                        metrics['Settling time (2%)'] = t[idx] - t_step
+                        break
+                else:
+                    metrics['Settling time (2%)'] = float('nan')
+            else:
+                metrics['Settling time (2%)'] = float('nan')
+        
+        elif is_constant:
+            # CONSTANT REFERENCE (STATION-KEEPING / DISTURBANCE REJECTION)
+            r_setpoint = r[0]
+            abs_error = np.abs(e)
+            max_error = np.max(abs_error)
+            
+            # Check if there's significant disturbance (deviation from setpoint)
+            # Lowered threshold to 0.001 to detect even small disturbances that are well-controlled
+            if max_error > 0.001:  # Threshold: 0.001 m or 0.001 m/s
+                max_error_idx = np.argmax(abs_error)
+                t_disturbance = t[max_error_idx]
+                
+                # Normalize error relative to peak disturbance (like y_norm in step response)
+                # error_norm = 1.0 at peak, 0.0 when fully recovered
+                error_norm = abs_error[max_error_idx:] / max_error
+                t_post = t[max_error_idx:]
+                
+                # Rise time: 90% recovery (error drops to 10% of peak)
                 try:
-                    t_10 = t[np.where(y_norm >= 0.1)[0][0]]
-                    t_90 = t[np.where(y_norm >= 0.9)[0][0]]
-                    metrics['Rise time (10-90%)'] = t_90 - t_10
+                    t_90_recovered = t_post[np.where(error_norm <= 0.1)[0][0]]
+                    metrics['Rise time (10-90%)'] = t_90_recovered - t_disturbance
                 except IndexError:
                     metrics['Rise time (10-90%)'] = float('nan')
-
-                # Overshoot
-                if r_step > 0:
-                    overshoot = (np.max(y) - r_final) / abs(r_final) * 100
-                else:
-                    overshoot = (r_final - np.min(y)) / abs(r_final) * 100
-                metrics['Overshoot (%)'] = max(0, overshoot)
-
-                # Settling time (2% band)
-                settled = np.where(np.abs(e) <= eps * abs(r_final))[0]
+                
+                # Settling time: 98% recovery (error drops to 2% of peak and stays there)
+                settling_threshold = 0.02  # 2% of peak error
+                settled = np.where(error_norm <= settling_threshold)[0]
                 if len(settled) > 0:
-                    # Check if it's settled for all future points
+                    # Find first point that stays settled (same logic as step response)
                     for idx in settled:
-                        if np.all(np.abs(e[idx:]) <= eps * abs(r_final)):
-                            metrics['Settling time (2%)'] = t[idx] - t[0]
+                        if np.all(error_norm[idx:] <= settling_threshold):
+                            metrics['Settling time (2%)'] = t_post[idx] - t_disturbance
                             break
                     else:
                         metrics['Settling time (2%)'] = float('nan')
                 else:
                     metrics['Settling time (2%)'] = float('nan')
+                
+                # Overshoot = peak deviation as percentage of reference
+                # If setpoint is zero, normalize by a reasonable value (0.1 m or 0.1 m/s)
+                norm_value = abs(r_setpoint) if abs(r_setpoint) > 1e-6 else 0.1
+                metrics['Overshoot (%)'] = (max_error / norm_value) * 100
+            else:
+                # No significant disturbance - no meaningful rise/settling time
+                metrics['Rise time (10-90%)'] = float('nan')
+                metrics['Settling time (2%)'] = float('nan')
+                metrics['Overshoot (%)'] = 0.0
+        
+        else:
+            # Complex reference (ramp, multi-step, etc.) - skip step metrics
+            metrics['Rise time (10-90%)'] = float('nan')
+            metrics['Settling time (2%)'] = float('nan')
+            metrics['Overshoot (%)'] = 0.0
         
         # Steady-state error (average of last X% of data points)
         n_final = max(1, int(N * final_pct / 100))
@@ -713,15 +776,23 @@ class ControlEvaluator:
         
         # Dynamic response
         print("\n--- Dynamic Response ---")
-        print(f"Rise time (10-90%): {metrics.get('Rise time (10-90%)', 'N/A'):.4g} s")
-        print(f"Settling time (2%): {metrics.get('Settling time (2%)', 'N/A'):.4g} s")
-        print(f"Overshoot:          {metrics.get('Overshoot (%)', 'N/A'):.2f} %")
-        print(f"Steady-state error: {metrics.get('Steady-state error', 'N/A'):.6g}")
+        rise_time = metrics.get('Rise time (10-90%)', 'N/A')
+        settling_time = metrics.get('Settling time (2%)', 'N/A')
+        overshoot = metrics.get('Overshoot (%)', 'N/A')
+        sse = metrics.get('Steady-state error', 'N/A')
+        
+        print(f"Rise time (10-90%): {rise_time:.4g} s" if isinstance(rise_time, (int, float)) else f"Rise time (10-90%): {rise_time}")
+        print(f"Settling time (2%): {settling_time:.4g} s" if isinstance(settling_time, (int, float)) else f"Settling time (2%): {settling_time}")
+        print(f"Overshoot:          {overshoot:.2f} %" if isinstance(overshoot, (int, float)) else f"Overshoot:          {overshoot}")
+        print(f"Steady-state error: {sse:.6g}" if isinstance(sse, (int, float)) else f"Steady-state error: {sse}")
         
         # Constraint handling
         print("\n--- Constraint Handling ---")
-        print(f"Control saturation: {metrics.get('Total saturation (%)', 'N/A'):.2f} %")
-        print(f"Max control rate:   {metrics.get('Max control rate', 'N/A'):.4g}")
+        sat = metrics.get('Total saturation (%)', 'N/A')
+        max_rate = metrics.get('Max control rate', 'N/A')
+        
+        print(f"Control saturation: {sat:.2f} %" if isinstance(sat, (int, float)) else f"Control saturation: {sat}")
+        print(f"Max control rate:   {max_rate:.4g}" if isinstance(max_rate, (int, float)) else f"Max control rate:   {max_rate}")
         
         print("\n" + "="*50 + "\n")
         
@@ -822,9 +893,9 @@ class ControlEvaluator:
 
 class BOEvaluator:
     """
-    Bayesian Optimization Evaluator for multi-stage PID tuning.
+    Bayesian Optimization Evaluator for cascade PID tuning.
     
-    Manages the evaluation of controller candidates across multiple scenarios,
+    Evaluates controller candidates for multiple scenarios,
     implements constraint checking, and provides a callable interface for
     Bayesian optimization libraries.
     
@@ -960,7 +1031,7 @@ class BOEvaluator:
                     cascade_controller=self.controller,
                     ref_fn=ref_fn,
                     mode=mode,
-                    use_feedforward=False
+                    use_feedforward=True  # Enable disturbances
                 )
             except Exception as e:
                 print(f"Scenario {i}: SIMULATION FAILED - {str(e)}")
@@ -1308,19 +1379,19 @@ if __name__ == "__main__":
     params = MSDParams(mass=20.0, damping=20.0, stiffness=0.0)
 
     # Simulation config for RK4
-    cfg = SimConfig(t0=0.0, tf=10.0, dt=0.001, x0=0.0, v0=0.0)
+    cfg = SimConfig(t0=0.0, tf=10.0, dt=0.05, x0=0.0, v0=0.0)
 
     # Standard tune guide for PID:
     # Increase Kp until response with minor overshoot
     # Add Ki to remove steady-state error
     # Add Kd to dampen overshoot (set deriv_tau ~ 1–5*dt for smoothing)
-    pid_p = PID(Kp=200.0, Ki=60.0, Kd=10.0, u_min=-50.0, u_max=50.0, deriv_tau=0.002)   # position PID
-    pid_v = PID(Kp=500.0, Ki=20.0, Kd=2.0, u_min=-50.0, u_max=50.0, deriv_tau=0.005)    # velocity PID
+    pid_p = PID(Kp=600.0, Ki=60.0, Kd=10.0, u_min=-50.0, u_max=50.0, deriv_tau=0.002)   # position PID
+    pid_v = PID(Kp=600.0, Ki=9400.0, Kd=0.0, u_min=-50.0, u_max=50.0, deriv_tau=0.005)    # velocity PID
     
     # Cascade PID controller (outer loop: position, inner loop: velocity)
     cascade_pid = CascadePID(
-        outer_Kp=50.0, outer_Ki=10.0, outer_Kd=5.0,    # Position loop gains
-        inner_Kp=100.0, inner_Ki=20.0, inner_Kd=2.0,   # Velocity loop gains
+        outer_Kp=160.0, outer_Ki=50.0, outer_Kd=0.0,    # Position loop gains
+        inner_Kp=700.0, inner_Ki=5000.0, inner_Kd=0.0,   # Velocity loop gains
         u_min=-50.0, u_max=50.0,
         outer_deriv_tau=0.002, inner_deriv_tau=0.005,
         velocity_limit=(-2.0, 2.0)  # Optional velocity saturation
@@ -1332,7 +1403,7 @@ if __name__ == "__main__":
     # Choose what to run
     # Set to "open-loop", "position", "velocity", "cascade", "velocity-setpoint", "comparison", or "bayesian_optimization"
     run_mode = "bayesian_optimization"
-    
+
     # Initialize MSD
     msd = MassSpringDamper(params, force_fn=lambda t: 0.0)  # force is provided by the PID in closed-loop
     
@@ -1372,14 +1443,14 @@ if __name__ == "__main__":
     
     elif run_mode == "velocity":
         # Velocity control example
-        ref_v = step_ref(magnitude=0.5, t_delay=2.0)  # 0.5 m/s
+        ref_v = step_ref(magnitude=0.3, t_delay=0.5)  # 0.5 m/s
         t, x, v, u, E, KE, PE, r_hist = msd.simulate_closed_loop(cfg, pid_v, ref_fn=ref_v, mode="velocity")
         plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode="velocity", params=params)
         
         # Evaluate velocity controller performance
         metrics = evaluator.evaluate(
             t=t, 
-            y=v,  # velocity is measured output
+            y=v,
             r=r_hist, 
             u=u, 
             u_min=pid_v.u_min, 
@@ -1392,29 +1463,102 @@ if __name__ == "__main__":
         evaluator.plot_error_analysis(t, v, r_hist, error)
     
     elif run_mode == "cascade":
-        # Cascade PID control example
-        ref_p = step_ref(magnitude=0.1, t_delay=0.5)
-        t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist = msd.simulate_cascade_loop(
-            cfg, cascade_pid, ref_fn=ref_p, mode="position", use_feedforward=False
-        )
-        plot_cascade(t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist, params, mode="position")
+        # Change this to switch between velocity and position control:
+        TEST_MODE = "position"  # "velocity" or "position"
         
-        # Evaluate cascade controller performance (based on position tracking)
+        # Configure test based on mode
+        if TEST_MODE == "velocity":
+            # VELOCITY MODE: Test inner loop directly (position loop disabled)
+            # Choose one of these reference scenarios:
+            
+            reference = Scenario.cruise(velocity=0.0)
+            disturbance = Scenario.disturbance_impulse(area=1.0, t_impulse=2.0, width=0.01)
+            test_description = "Cruise at 0 m/s with impulse disturbance"
+            
+            # reference = Scenario.step_velocity(magnitude=0.2, t_start=0.5)
+            # disturbance = lambda t: 0.0
+            # test_description = "Velocity step 0.2 m/s"
+            
+            control_mode = "velocity"
+            active_loop = "Inner (velocity)"
+            
+        else:
+            # POSITION MODE: Test full cascade (both loops active)
+            # Choose one of these reference scenarios:
+            
+            reference = Scenario.step_position(magnitude=0.1, t_start=0.5)
+            disturbance = lambda t: 0.0
+            test_description = "Position step 0.1 m"
+            
+            # reference = Scenario.step_position(magnitude=0.1, t_start=0.5)
+            # disturbance = Scenario.disturbance_step(magnitude=5.0, t_start=5.0)
+            # test_description = "Position step 0.1 m with disturbance at t=5s"
+            
+            control_mode = "position"
+            active_loop = "Both (cascade)"
+        
+        # Update MSD with disturbance
+        msd.F = disturbance
+        
+        # Run simulation
+        test_cfg = SimConfig(t0=0.0, tf=15.0, dt=0.001, x0=0.0, v0=0.0)
+        
+        t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist = msd.simulate_cascade_loop(
+            test_cfg, cascade_pid, ref_fn=reference, mode=control_mode, use_feedforward=True
+        )
+        
+        # Select controlled variable and reference based on mode
+        if TEST_MODE == "velocity":
+            controlled_variable = v
+            reference_signal = v_ref_hist
+        else:  # position
+            controlled_variable = x
+            reference_signal = x_ref_hist
+        
+        # Plot results
+        plot_cascade(t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist, params, mode=control_mode)
+        
+        # Evaluate controller performance
         metrics = evaluator.evaluate(
             t=t,
-            y=x,  # position is the primary controlled variable
-            r=x_ref_hist,  # position reference
-            u=u, 
-            u_min=cascade_pid.inner_pid.u_min, 
+            y=controlled_variable,
+            r=reference_signal,
+            u=u,
+            u_min=cascade_pid.inner_pid.u_min,
             u_max=cascade_pid.inner_pid.u_max
         )
         evaluator.print_metrics(metrics)
         
-        # Plot error analysis for position tracking
-        error = x_ref_hist - x
-        evaluator.plot_error_analysis(t, x, x_ref_hist, error)
+        # Calculate cost J
+        weights_cfg = {
+            'rise_time': 0.25,
+            'settling_time': 0.35,
+            'overshoot': 0.20,
+            'sse': 0.20
+        }
+        normalization_refs = {
+            'rise_time': 1.0,
+            'settling_time': 5.0,
+            'overshoot': 20.0,
+            'sse': 0.01
+        }
+        J = evaluator.cost_from_metrics(
+            [metrics],
+            weights=weights_cfg,
+            normalization_refs=normalization_refs,
+            use_worst_case=False
+        )
+        print(f"\n=== COST FUNCTION ===")
+        print(f"Cost J: {J:.6f} (lower is better)")
         
-        print("\n=== CASCADE CONTROLLER INFO ===")
+        # Plot error analysis
+        error = reference_signal - controlled_variable
+        evaluator.plot_error_analysis(t, controlled_variable, reference_signal, error)
+        
+        # Print controller info
+        print(f"\n=== CASCADE CONTROLLER INFO ({TEST_MODE.upper()} MODE) ===")
+        print(f"Test: {test_description}")
+        print(f"Active loop: {active_loop}")
         print(f"Outer loop gains (position): Kp={cascade_pid.outer_pid.Kp}, Ki={cascade_pid.outer_pid.Ki}, Kd={cascade_pid.outer_pid.Kd}")
         print(f"Inner loop gains (velocity): Kp={cascade_pid.inner_pid.Kp}, Ki={cascade_pid.inner_pid.Ki}, Kd={cascade_pid.inner_pid.Kd}")
         if cascade_pid.velocity_limit:
@@ -1501,44 +1645,45 @@ if __name__ == "__main__":
         # 1. DEFINE TEST SCENARIOS
         print("Setting up test scenarios...")
         
-        test_scenarios = [
-            # Position control scenarios
-            (Scenario.step_position(magnitude=0.1, t_start=0.5), 
-             lambda t: 0.0, 
-             "position"),
-            
-            (Scenario.ramp_position(slope=0.05, t_start=0.5, t_end=5.0),
+        # Stage 1: Inner loop (velocity) test scenarios
+        inner_scenarios = [
+            # Velocity step response
+            (Scenario.step_velocity(magnitude=0.2, t_start=0.5),
              lambda t: 0.0,
-             "position"),
+             "velocity"),
             
-            (Scenario.multi_step_position([0.05, 0.15, 0.08], [0.5, 3.0, 6.0]),
-             lambda t: 0.0,
-             "position"),
-            
-            # Position control with disturbances
-            (Scenario.station_keeping(position=0.1),
-             Scenario.disturbance_step(magnitude=5.0, t_start=2.0),
-             "position"),
-            
+            # Cruise with step disturbance
+            # (Scenario.cruise(velocity=0.0),
+            #  Scenario.disturbance_impulse(area=1.0, t_impulse=2.0, width=0.01),
+            #  "velocity"),
+        ]
+        
+        # Stage 2: Outer loop (position) test scenarios
+        outer_scenarios = [
+            # Position step response
             (Scenario.step_position(magnitude=0.1, t_start=0.5),
-             Scenario.disturbance_sinusoidal(amplitude=2.0, frequency=0.5),
+             lambda t: 0.0,
              "position"),
         ]
         
-        print(f"  ✓ Created {len(test_scenarios)} test scenarios\n")
+        # Start with inner loop scenarios
+        test_scenarios = inner_scenarios
+        
+        print(f"  ✓ Created {len(inner_scenarios)} inner loop scenarios")
+        print(f"  ✓ Created {len(outer_scenarios)} outer loop scenarios\n")
         
         # 2. CONFIGURE BAYESIAN OPTIMIZATION
         
         bounds_log10 = {
             # Inner loop (velocity PI): tune first
             'inner': {
-                'log10_Kp_v': [0.5, 3.0],   # Kp_v ∈ [3.16, 1000]
-                'log10_Ki_v': [-1.0, 2.0],  # Ki_v ∈ [0.1, 100]
+            'log10_Kp_v': [-1.0, 4.0],   # log10(Kp_v) ∈ [-1.0, 4.0] => Kp_v ∈ [0.1, 10000]
+            'log10_Ki_v': [-1.0, 4.0],   # log10(Ki_v) ∈ [-1.0, 4.0] => Ki_v ∈ [0.1, 10000]
             },
             # Outer loop (position PI): tune second with fixed inner loop
             'outer': {
-                'log10_Kp_x': [0.0, 2.5],   # Kp_x ∈ [1, 316]
-                'log10_Ki_x': [-1.0, 2.0],  # Ki_x ∈ [0.1, 100]
+            'log10_Kp_x': [-1.0, 3.0],   # log10(Kp_x) ∈ [-1.0, 3.0] => Kp_x ∈ [0.1, 1000]
+            'log10_Ki_x': [-10.0, 2.0],  # log10(Ki_x) ∈ [-10.0, 2.0] => Ki_x ∈ [1e-10, 100]
             },
             # Joint optimization: fine-tune all four gains together
             'joint': {
@@ -1570,7 +1715,7 @@ if __name__ == "__main__":
         safety_cfg = {
             'max_saturation': 90.0,   # Allow up to 90% saturation
             'max_energy': 1e5,        # Energy divergence threshold
-            'max_position': 5.0       # Position envelope [m]
+            'max_position': 20.0       # Position envelope [m]
         }
         
         print("Configuration:")
@@ -1578,20 +1723,18 @@ if __name__ == "__main__":
         print(f"  Safety: max_sat={safety_cfg['max_saturation']}%, max_E={safety_cfg['max_energy']:.1e}, max_x={safety_cfg['max_position']}m")
         print()
         
-        # ------------------------------------------------------------------------
         # 3. CREATE BOEvaluator
-        # ------------------------------------------------------------------------
         
-        # Create fresh controller for optimization
+        # initial gains - will be overwritten by BO
         opt_cascade_pid = CascadePID(
-            outer_Kp=10.0, outer_Ki=1.0, outer_Kd=0.0,  # Will be overwritten
-            inner_Kp=10.0, inner_Ki=1.0, inner_Kd=0.0,  # Will be overwritten
+            outer_Kp=10.0, outer_Ki=1.0, outer_Kd=0.0,
+            inner_Kp=10.0, inner_Ki=1.0, inner_Kd=0.0,
             u_min=-50.0, u_max=50.0,
             velocity_limit=(-2.0, 2.0)
         )
         
-        # Shorter simulation for optimization (faster evaluations)
-        opt_sim_cfg = SimConfig(t0=0.0, tf=8.0, dt=0.001, x0=0.0, v0=0.0)
+        # Simulation config for optimization (long time to ensure even slow controllers can settle)
+        opt_sim_cfg = SimConfig(t0=0.0, tf=10.0, dt=0.05, x0=0.0, v0=0.0)
         
         # Create BOEvaluator
         bo_evaluator = BOEvaluator(
@@ -1608,9 +1751,8 @@ if __name__ == "__main__":
         
         print("BOEvaluator created successfully\n")
         
-        # ------------------------------------------------------------------------
         # 4. STAGE 1: OPTIMIZE INNER LOOP (VELOCITY)
-        # ------------------------------------------------------------------------
+
         print("="*80)
         print("STAGE 1: INNER LOOP OPTIMIZATION (Velocity PI Gains)")
         print("="*80 + "\n")
@@ -1618,10 +1760,11 @@ if __name__ == "__main__":
         bo_evaluator.set_stage('inner')
         
         # Manual seed points (good starting guesses in log10 space)
+        # Centered around Kp=100.0, Ki=50.0
         inner_seeds = [
-            {'log10_Kp_v': 2.0, 'log10_Ki_v': 1.0},   # Kp=100, Ki=10 (baseline)
-            {'log10_Kp_v': 1.5, 'log10_Ki_v': 0.5},   # Kp=31.6, Ki=3.16
-            {'log10_Kp_v': 2.3, 'log10_Ki_v': 1.3},   # Kp=200, Ki=20
+            {'log10_Kp_v': 3.0, 'log10_Ki_v': 4.0},   # Kp=1000, Ki=10000 (baseline)
+            {'log10_Kp_v': 2.8, 'log10_Ki_v': 3.7},   # Kp=630, Ki=5000 (lower)
+            {'log10_Kp_v': 3.2, 'log10_Ki_v': 4.3},   # Kp=1600, Ki=20000 (higher)
         ]
         
         # Create Bayesian Optimization object for inner loop
@@ -1660,9 +1803,7 @@ if __name__ == "__main__":
         
         inner_optimizer.maximize(
             init_points=5,      # Additional random initialization
-            n_iter=25,          # Number of BO iterations
-            acq='ei',           # Expected Improvement
-            xi=0.01            # Small exploration parameter
+            n_iter=25           # Number of BO iterations
         )
         
         # Extract best inner loop gains
@@ -1681,20 +1822,22 @@ if __name__ == "__main__":
         # Fix inner loop gains for next stage
         opt_cascade_pid.set_inner_gains(best_inner_gains['Kp_v'], best_inner_gains['Ki_v'])
         
-        # ------------------------------------------------------------------------
         # 5. STAGE 2: OPTIMIZE OUTER LOOP (POSITION)
-        # ------------------------------------------------------------------------
+
         print("="*80)
         print("STAGE 2: OUTER LOOP OPTIMIZATION (Position PI Gains)")
         print("="*80 + "\n")
         
+        # Switch to outer loop scenarios
+        bo_evaluator.scenarios = outer_scenarios
         bo_evaluator.set_stage('outer')
         
         # Manual seed points for outer loop
+        # Centered around Kp=50.0, Ki=10.0
         outer_seeds = [
-            {'log10_Kp_x': 1.7, 'log10_Ki_x': 1.0},   # Kp=50, Ki=10 (baseline)
-            {'log10_Kp_x': 1.3, 'log10_Ki_x': 0.7},   # Kp=20, Ki=5
-            {'log10_Kp_x': 2.0, 'log10_Ki_x': 1.3},   # Kp=100, Ki=20
+            {'log10_Kp_x': 2.0, 'log10_Ki_x': 2.0},   # Kp=100, Ki=100 (baseline)
+            {'log10_Kp_x': 1.8, 'log10_Ki_x': 1.8},   # Kp=63, Ki=63 (lower)
+            {'log10_Kp_x': 2.2, 'log10_Ki_x': 2.2},   # Kp=158, Ki=158 (higher)
         ]
         
         # Create optimizer for outer loop
@@ -1731,9 +1874,7 @@ if __name__ == "__main__":
         
         outer_optimizer.maximize(
             init_points=5,
-            n_iter=25,
-            acq='ei',
-            xi=0.01
+            n_iter=25
         )
         
         # Extract best outer loop gains
@@ -1752,84 +1893,89 @@ if __name__ == "__main__":
         # Fix outer loop gains for next stage
         opt_cascade_pid.set_outer_gains(best_outer_gains['Kp_x'], best_outer_gains['Ki_x'])
         
-        # ------------------------------------------------------------------------
-        # 6. STAGE 3: JOINT OPTIMIZATION (FINE-TUNING)
-        # ------------------------------------------------------------------------
-        print("="*80)
-        print("STAGE 3: JOINT OPTIMIZATION (All Four PI Gains)")
-        print("="*80 + "\n")
+        # # 6. STAGE 3: JOINT OPTIMIZATION (FINE-TUNING)
+        # # COMMENTED OUT - Using sequential optimization only
+        #
+        # print("="*80)
+        # print("STAGE 3: JOINT OPTIMIZATION (All Four PI Gains)")
+        # print("="*80 + "\n")
+        #
+        # bo_evaluator.set_stage('joint')
+        #
+        # # Seed with best from previous stages
+        # joint_seeds = [
+        #     {
+        #         'log10_Kp_v': best_inner['params']['log10_Kp_v'],
+        #         'log10_Ki_v': best_inner['params']['log10_Ki_v'],
+        #         'log10_Kp_x': best_outer['params']['log10_Kp_x'],
+        #         'log10_Ki_x': best_outer['params']['log10_Ki_x']
+        #     },
+        # ]
+        #
+        # # Create optimizer for joint optimization
+        # joint_optimizer = BayesianOptimization(
+        #     f=bo_evaluator,
+        #     pbounds=bounds_log10['joint'],
+        #     random_state=44,
+        #     allow_duplicate_points=False
+        # )
+        #
+        # # Configure GP (4D now)
+        # joint_optimizer.set_gp_params(
+        #     kernel=Matern(nu=2.5, length_scale=[1.0]*4, length_scale_bounds=[(0.1, 10.0)]*4),
+        #     alpha=1e-4,
+        #     n_restarts_optimizer=5
+        # )
+        #
+        # # Probe seed point
+        # print("Probing best from previous stages...")
+        # for i, seed in enumerate(joint_seeds):
+        #     try:
+        #         joint_optimizer.probe(params=seed, lazy=False)
+        #         print(f"  Seed {i+1}/{len(joint_seeds)} evaluated")
+        #     except Exception as e:
+        #         print(f"  Seed {i+1} failed: {e}")
+        #
+        # print()
+        #
+        # # Run joint optimization (fewer iterations since 4D is more expensive)
+        # print("Running Joint Bayesian Optimization...")
+        # print(f"  Initial random points: 8")
+        # print(f"  Optimization iterations: 30")
+        # print()
+        #
+        # joint_optimizer.maximize(
+        #     init_points=8,
+        #     n_iter=30
+        # )
+        #
+        # # Extract best joint gains
+        # best_joint = joint_optimizer.max
+        # best_joint_gains = {
+        #     'Kp_v': 10 ** best_joint['params']['log10_Kp_v'],
+        #     'Ki_v': 10 ** best_joint['params']['log10_Ki_v'],
+        #     'Kp_x': 10 ** best_joint['params']['log10_Kp_x'],
+        #     'Ki_x': 10 ** best_joint['params']['log10_Ki_x']
+        # }
+        #
+        # print("\n" + "-"*80)
+        # print(f"STAGE 3 COMPLETE")
+        # print(f"Best Joint Gains:")
+        # print(f"  Inner: Kp_v={best_joint_gains['Kp_v']:.2f}, Ki_v={best_joint_gains['Ki_v']:.2f}")
+        # print(f"  Outer: Kp_x={best_joint_gains['Kp_x']:.2f}, Ki_x={best_joint_gains['Ki_x']:.2f}")
+        # print(f"Best Cost J: {-best_joint['target']:.6f}")
+        # print("-"*80 + "\n")
         
-        bo_evaluator.set_stage('joint')
-        
-        # Seed with best from previous stages
-        joint_seeds = [
-            {
-                'log10_Kp_v': best_inner['params']['log10_Kp_v'],
-                'log10_Ki_v': best_inner['params']['log10_Ki_v'],
-                'log10_Kp_x': best_outer['params']['log10_Kp_x'],
-                'log10_Ki_x': best_outer['params']['log10_Ki_x']
-            },
-        ]
-        
-        # Create optimizer for joint optimization
-        joint_optimizer = BayesianOptimization(
-            f=bo_evaluator,
-            pbounds=bounds_log10['joint'],
-            random_state=44,
-            allow_duplicate_points=False
-        )
-        
-        # Configure GP (4D now)
-        joint_optimizer.set_gp_params(
-            kernel=Matern(nu=2.5, length_scale=[1.0]*4, length_scale_bounds=[(0.1, 10.0)]*4),
-            alpha=1e-4,
-            n_restarts_optimizer=5
-        )
-        
-        # Probe seed point
-        print("Probing best from previous stages...")
-        for i, seed in enumerate(joint_seeds):
-            try:
-                joint_optimizer.probe(params=seed, lazy=False)
-                print(f"  Seed {i+1}/{len(joint_seeds)} evaluated")
-            except Exception as e:
-                print(f"  Seed {i+1} failed: {e}")
-        
-        print()
-        
-        # Run joint optimization (fewer iterations since 4D is more expensive)
-        print("Running Joint Bayesian Optimization...")
-        print(f"  Initial random points: 8")
-        print(f"  Optimization iterations: 30")
-        print()
-        
-        joint_optimizer.maximize(
-            init_points=8,
-            n_iter=30,
-            acq='ei',
-            xi=0.02  # Slightly more exploration in higher dimensions
-        )
-        
-        # Extract best joint gains
-        best_joint = joint_optimizer.max
-        best_joint_gains = {
-            'Kp_v': 10 ** best_joint['params']['log10_Kp_v'],
-            'Ki_v': 10 ** best_joint['params']['log10_Ki_v'],
-            'Kp_x': 10 ** best_joint['params']['log10_Kp_x'],
-            'Ki_x': 10 ** best_joint['params']['log10_Ki_x']
+        # Use best gains from sequential optimization
+        best_final_gains = {
+            'Kp_v': best_inner_gains['Kp_v'],
+            'Ki_v': best_inner_gains['Ki_v'],
+            'Kp_x': best_outer_gains['Kp_x'],
+            'Ki_x': best_outer_gains['Ki_x']
         }
         
-        print("\n" + "-"*80)
-        print(f"STAGE 3 COMPLETE")
-        print(f"Best Joint Gains:")
-        print(f"  Inner: Kp_v={best_joint_gains['Kp_v']:.2f}, Ki_v={best_joint_gains['Ki_v']:.2f}")
-        print(f"  Outer: Kp_x={best_joint_gains['Kp_x']:.2f}, Ki_x={best_joint_gains['Ki_x']:.2f}")
-        print(f"Best Cost J: {-best_joint['target']:.6f}")
-        print("-"*80 + "\n")
-        
-        # ------------------------------------------------------------------------
         # 7. SUMMARY AND CONVERGENCE PLOTS
-        # ------------------------------------------------------------------------
+    
         print("="*80)
         print("OPTIMIZATION SUMMARY")
         print("="*80 + "\n")
@@ -1837,12 +1983,18 @@ if __name__ == "__main__":
         bo_evaluator.print_best()
         
         # Plot convergence for each stage
-        fig, axs = plt.subplots(3, 1, figsize=(10, 10))
+        fig, axs = plt.subplots(2, 1, figsize=(10, 8))
         
         # Inner loop convergence
         inner_targets = [-res['target'] for res in inner_optimizer.res]  # Convert back to J (cost)
+        
+        # Filter out extreme values for better visualization
+        # Keep values below 10x the minimum (or use a fixed threshold)
+        min_J_inner = min(inner_targets)
+        
         axs[0].plot(inner_targets, 'b-o', markersize=4)
-        axs[0].axhline(y=min(inner_targets), color='r', linestyle='--', label=f'Best J={min(inner_targets):.4f}')
+        axs[0].axhline(y=min_J_inner, color='r', linestyle='--', label=f'Best J={min_J_inner:.4f}')
+        axs[0].set_ylim([0, 5])  # Limit y-axis to filter extreme values
         axs[0].set_ylabel('Cost J')
         axs[0].set_title('Stage 1: Inner Loop (Velocity) Convergence')
         axs[0].grid(True, alpha=0.3)
@@ -1850,42 +2002,43 @@ if __name__ == "__main__":
         
         # Outer loop convergence
         outer_targets = [-res['target'] for res in outer_optimizer.res]
+        
+        # Filter out extreme values for better visualization
+        min_J_outer = min(outer_targets)
+        
         axs[1].plot(outer_targets, 'g-o', markersize=4)
-        axs[1].axhline(y=min(outer_targets), color='r', linestyle='--', label=f'Best J={min(outer_targets):.4f}')
+        axs[1].axhline(y=min_J_outer, color='r', linestyle='--', label=f'Best J={min_J_outer:.4f}')
+        axs[1].set_ylim([0, 5])  # Limit y-axis
         axs[1].set_ylabel('Cost J')
+        axs[1].set_xlabel('Iteration')
         axs[1].set_title('Stage 2: Outer Loop (Position) Convergence')
         axs[1].grid(True, alpha=0.3)
         axs[1].legend()
         
-        # Joint optimization convergence
-        joint_targets = [-res['target'] for res in joint_optimizer.res]
-        axs[2].plot(joint_targets, 'm-o', markersize=4)
-        axs[2].axhline(y=min(joint_targets), color='r', linestyle='--', label=f'Best J={min(joint_targets):.4f}')
-        axs[2].set_ylabel('Cost J')
-        axs[2].set_xlabel('Iteration')
-        axs[2].set_title('Stage 3: Joint Optimization Convergence')
-        axs[2].grid(True, alpha=0.3)
-        axs[2].legend()
+        # # Joint optimization convergence (COMMENTED OUT)
+        # joint_targets = [-res['target'] for res in joint_optimizer.res]
+        # axs[2].plot(joint_targets, 'm-o', markersize=4)
+        # axs[2].axhline(y=min(joint_targets), color='r', linestyle='--', label=f'Best J={min(joint_targets):.4f}')
+        # axs[2].set_ylabel('Cost J')
+        # axs[2].set_xlabel('Iteration')
+        # axs[2].set_title('Stage 3: Joint Optimization Convergence')
+        # axs[2].grid(True, alpha=0.3)
+        # axs[2].legend()
         
         plt.tight_layout()
         plt.savefig('bo_convergence.png', dpi=150, bbox_inches='tight')
         print("Convergence plot saved to: bo_convergence.png\n")
         plt.show()
         
-        # ------------------------------------------------------------------------
         # 8. FINAL VALIDATION
-        # ------------------------------------------------------------------------
-        print("="*80)
-        print("FINAL VALIDATION ON TEST SCENARIO")
-        print("="*80 + "\n")
         
         # Apply best gains to a fresh controller
         final_cascade_pid = CascadePID(
-            outer_Kp=best_joint_gains['Kp_x'],
-            outer_Ki=best_joint_gains['Ki_x'],
+            outer_Kp=best_final_gains['Kp_x'],
+            outer_Ki=best_final_gains['Ki_x'],
             outer_Kd=0.0,
-            inner_Kp=best_joint_gains['Kp_v'],
-            inner_Ki=best_joint_gains['Ki_v'],
+            inner_Kp=best_final_gains['Kp_v'],
+            inner_Ki=best_final_gains['Ki_v'],
             inner_Kd=0.0,
             u_min=-50.0, u_max=50.0,
             velocity_limit=(-2.0, 2.0)
@@ -1893,7 +2046,7 @@ if __name__ == "__main__":
         
         # Run a longer validation simulation
         val_cfg = SimConfig(t0=0.0, tf=15.0, dt=0.001, x0=0.0, v0=0.0)
-        ref_val = Scenario.multi_step_position([0.0, 0.15, 0.05, 0.2], [0.0, 2.0, 6.0, 10.0])
+        ref_val = Scenario.step_position(magnitude=0.15, t_start=1.0)  # Simple step for clear metrics
         
         t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist = msd.simulate_cascade_loop(
             cfg=val_cfg,
@@ -1914,7 +2067,3 @@ if __name__ == "__main__":
         
         # Plot validation results
         plot_cascade(t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist, params, mode="position")
-        
-        print("\n" + "="*80)
-        print("BAYESIAN OPTIMIZATION COMPLETE!")
-        print("="*80 + "\n")
