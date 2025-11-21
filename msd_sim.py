@@ -22,9 +22,12 @@ Usage:
 from dataclasses import dataclass
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.stats import norm
+from sklearn.base import clone
 
 try:
     from bayes_opt import BayesianOptimization
+    from bayes_opt.acquisition import UpperConfidenceBound, ExpectedImprovement
     BAYES_OPT_AVAILABLE = True
 except ImportError as e:
     BAYES_OPT_AVAILABLE = False
@@ -589,7 +592,7 @@ class Scenario:
         
         return random_disturbance
 
-class ControlEvaluator:
+class ControllerMetrics:
     """
     Calculates and displays performance metrics for controller evaluation.
     Provides methods to assess
@@ -827,7 +830,7 @@ class ControlEvaluator:
         Pipeline: timeseries → metrics → normalized metrics → weighted sum → J
         
         This method is purely about metric aggregation and does NOT perform constraint
-        checking. Constraint validation should be done upstream (e.g., in BOEvaluator).
+        checking. Constraint validation should be done upstream (e.g., in BayesianOptimizer).
         
         Args:
             metrics_list: List of per-scenario metrics dictionaries from evaluate()
@@ -891,7 +894,7 @@ class ControlEvaluator:
         
         return J
 
-class BOEvaluator:
+class BayesianOptimizer:
     """
     Bayesian Optimization Evaluator for cascade PID tuning.
     
@@ -913,7 +916,7 @@ class BOEvaluator:
         Args:
             plant: MassSpringDamper instance (the system to control)
             controller: CascadePID instance (the controller to tune)
-            evaluator: ControlEvaluator instance (for computing metrics)
+            evaluator: ControllerMetrics instance (for computing metrics)
             scenarios: List of scenario tuples: [(ref_fn, disturbance_fn, mode), ...]
                       Each tuple contains (reference_function, disturbance_function, control_mode)
             bounds_log10: Dict of log10 parameter bounds per stage:
@@ -945,7 +948,7 @@ class BOEvaluator:
         self.bounds_log10 = bounds_log10
         self.weights_cfg = weights_cfg
         self.safety_cfg = safety_cfg
-        self.sim_cfg = sim_cfg if sim_cfg is not None else SimConfig(tf=10.0, dt=0.001)
+        self.sim_cfg = sim_cfg if sim_cfg is not None else SimConfig(tf=10.0, dt=0.05)
         self.rng = rng if rng is not None else np.random.RandomState(42)
         
         # Store best results per stage
@@ -1305,7 +1308,7 @@ def plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode, params):
                  f"ζ={zeta:.3f}, ωₙ={wn:.3f} rad/s")
     plt.tight_layout()
     plt.show()
-
+ 
 def plot_cascade(t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist, params, mode="position"):
     """Plot results for cascade PID control showing both position and velocity loops"""
     fig, axs = plt.subplots(6, 1, figsize=(10, 14), sharex=True)
@@ -1374,6 +1377,538 @@ def c_to_zeta(c, m, k):
         return float('inf')  # Pure damping system (no spring)
     return c / (2.0*np.sqrt(k*m))
 
+
+def plot_gp_and_acquisition_2d(optimizer, stage_name='inner', param_names=None, acquisition_func=None):
+    """
+    Visualize GP mean/uncertainty and acquisition function for 2D optimization.
+    
+    Similar to the example at:
+    https://bayesian-optimization.github.io/BayesianOptimization/3.1.0/acquisition_functions.html
+    
+    Args:
+        optimizer: BayesianOptimization instance with fitted GP
+        stage_name: Name for saving plots ('inner' or 'outer')
+        param_names: List of 2 parameter names [param1, param2]
+        acquisition_func: The acquisition function object (ExpectedImprovement, etc.)
+    """
+    if len(optimizer.space) < 2:
+        print(f"  Skipping {stage_name} visualization: need at least 2 evaluations")
+        return
+    
+    # Get parameter bounds
+    if param_names is None:
+        param_names = list(optimizer.space.keys)
+    
+    bounds = optimizer.space.bounds
+    x1_min, x1_max = bounds[0]
+    x2_min, x2_max = bounds[1]
+    
+    # Create grid for evaluation
+    n_grid = 100
+    x1 = np.linspace(x1_min, x1_max, n_grid)
+    x2 = np.linspace(x2_min, x2_max, n_grid)
+    X1, X2 = np.meshgrid(x1, x2)
+    grid_points = np.column_stack([X1.ravel(), X2.ravel()])
+    
+    # Get GP predictions
+    mu, sigma = optimizer._gp.predict(grid_points, return_std=True)
+    mu = mu.reshape(n_grid, n_grid)
+    sigma = sigma.reshape(n_grid, n_grid)
+    
+    # Get acquisition function values
+    if acquisition_func is not None:
+        acquisition_func._fit_gp(optimizer._gp, optimizer._space)
+        acq_func = acquisition_func._get_acq(gp=optimizer._gp)
+        utility = -1 * acq_func(grid_points)  # Negate because library minimizes internally
+        utility = utility.reshape(n_grid, n_grid)
+        
+        # Find next best point
+        next_idx = np.argmax(utility)
+        next_x1 = grid_points[next_idx, 0]
+        next_x2 = grid_points[next_idx, 1]
+    else:
+        utility = None
+        next_x1, next_x2 = None, None
+    
+    # Get observed points
+    x_obs = np.array([[res["params"][param_names[0]], res["params"][param_names[1]]] 
+                      for res in optimizer.res])
+    y_obs = np.array([res["target"] for res in optimizer.res])
+    
+    # Create figure with 3 subplots
+    fig = plt.figure(figsize=(18, 5))
+    steps = len(optimizer.space)
+    fig.suptitle(f'{stage_name.upper()} Loop: GP and Utility Function After {steps} Steps', 
+                 fontsize=16, fontweight='bold')
+    
+    # 1. GP Mean (Prediction)
+    ax1 = plt.subplot(131)
+    contour1 = ax1.contourf(X1, X2, mu, levels=20, cmap='viridis')
+    ax1.plot(x_obs[:, 0], x_obs[:, 1], 'r.', markersize=10, label='Observations')
+    ax1.plot(x_obs[-1, 0], x_obs[-1, 1], 'r*', markersize=15, label='Last Point')
+    cbar1 = plt.colorbar(contour1, ax=ax1)
+    cbar1.set_label('GP Mean (predicted target)')
+    ax1.set_xlabel(param_names[0])
+    ax1.set_ylabel(param_names[1])
+    ax1.set_title('GP Mean Prediction')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. GP Uncertainty (Std Dev)
+    ax2 = plt.subplot(132)
+    contour2 = ax2.contourf(X1, X2, sigma, levels=20, cmap='coolwarm')
+    ax2.plot(x_obs[:, 0], x_obs[:, 1], 'k.', markersize=10, label='Observations')
+    ax2.plot(x_obs[-1, 0], x_obs[-1, 1], 'k*', markersize=15, label='Last Point')
+    cbar2 = plt.colorbar(contour2, ax=ax2)
+    cbar2.set_label('GP Uncertainty (std)')
+    ax2.set_xlabel(param_names[0])
+    ax2.set_ylabel(param_names[1])
+    ax2.set_title('GP Uncertainty (Standard Deviation)')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # 3. Acquisition Function (Utility)
+    if utility is not None:
+        ax3 = plt.subplot(133)
+        contour3 = ax3.contourf(X1, X2, utility, levels=20, cmap='plasma')
+        ax3.plot(x_obs[:, 0], x_obs[:, 1], 'w.', markersize=10, label='Observations')
+        if next_x1 is not None:
+            ax3.plot(next_x1, next_x2, 'y*', markersize=20, 
+                    markeredgecolor='k', markeredgewidth=1.5,
+                    label='Next Best Guess')
+        cbar3 = plt.colorbar(contour3, ax=ax3)
+        cbar3.set_label('Acquisition Function (EI)')
+        ax3.set_xlabel(param_names[0])
+        ax3.set_ylabel(param_names[1])
+        ax3.set_title('Utility Function (Expected Improvement)')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    filename = f'gp_acquisition_{stage_name}.png'
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    print(f"  ✓ Saved: {filename}")
+    plt.close()  # Close to avoid showing during optimization
+
+
+def plot_bo_progression_2d(optimizer, stage_name='inner', param_names=None, 
+                           iterations_to_show=[5, 15, 30, 50], 
+                           acquisition_func=None):
+    """
+    Create 2D contour progression plots showing GP evolution through iterations.
+    
+    Shows snapshots of GP mean, uncertainty, and acquisition function at different
+    iteration milestones. Much more informative than just the final converged state.
+    
+    Args:
+        optimizer: BayesianOptimization instance
+        stage_name: 'inner' or 'outer'
+        param_names: List of 2 parameter names [param1, param2]
+        iterations_to_show: List of iteration milestones to visualize
+        acquisition_func: The acquisition function object (for EI calculation)
+    """
+    if param_names is None:
+        param_names = list(optimizer.space.keys)
+    
+    # Get parameter bounds
+    bounds = optimizer.space.bounds
+    x1_min, x1_max = bounds[0]
+    x2_min, x2_max = bounds[1]
+    
+    # Create grid for evaluation
+    n_grid = 80  # Slightly lower resolution for faster computation
+    x1 = np.linspace(x1_min, x1_max, n_grid)
+    x2 = np.linspace(x2_min, x2_max, n_grid)
+    X1, X2 = np.meshgrid(x1, x2)
+    grid_points = np.column_stack([X1.ravel(), X2.ravel()])
+    
+    # Filter iterations to those that actually exist
+    max_iter = len(optimizer.res)
+    iterations_to_show = [i for i in iterations_to_show if i <= max_iter]
+    
+    if not iterations_to_show:
+        print(f"  Warning: No valid iterations to show for {stage_name}")
+        return None
+    
+    # Create figure with subplots (3 columns x N rows)
+    n_rows = len(iterations_to_show)
+    fig, axes = plt.subplots(n_rows, 3, figsize=(18, 5*n_rows))
+    
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    
+    print(f"  Creating {stage_name} progression with {n_rows} snapshots...")
+    
+    for row_idx, n_iter in enumerate(iterations_to_show):
+        # Get data up to this iteration
+        if n_iter == 0:
+            # Just show prior (no data)
+            X_obs = np.array([]).reshape(0, 2)
+            y_obs = np.array([])
+        else:
+            res_subset = optimizer.res[:n_iter]
+            X_obs = np.array([[res["params"][pname] for pname in param_names] 
+                             for res in res_subset])
+            y_obs = np.array([res["target"] for res in res_subset])
+        
+        # Debug: Show what's really being plotted
+        if len(y_obs) > 0:
+            print(f"    Iter {n_iter}: {len(X_obs)} obs, y_max={y_obs.max():.6f}, xi={acquisition_func.xi if acquisition_func else 'N/A'}")
+        
+        # Fit GP with data up to this iteration
+        if len(X_obs) > 0:
+            temp_gp = clone(optimizer._gp)
+            temp_gp.fit(X_obs, y_obs)
+            
+            # Get GP predictions
+            mu, sigma = temp_gp.predict(grid_points, return_std=True)
+            mu = mu.reshape(n_grid, n_grid)
+            sigma = sigma.reshape(n_grid, n_grid)
+            
+            # Calculate acquisition function
+            if acquisition_func is not None:
+                y_max = y_obs.max()
+                mu_flat = mu.ravel()
+                sigma_flat = sigma.ravel()
+                
+                # Manually calculate EI
+                with np.errstate(divide='warn', invalid='ignore'):
+                    imp = mu_flat - y_max - acquisition_func.xi
+                    Z = imp / sigma_flat
+                    ei = imp * norm.cdf(Z) + sigma_flat * norm.pdf(Z)
+                    ei[sigma_flat == 0.0] = 0.0
+                
+                utility = ei.reshape(n_grid, n_grid)
+                
+                # Debug: Show EI statistics
+                print(f"      EI: min={ei.min():.2e}, max={ei.max():.2e}, mean={ei.mean():.2e}, sigma: min={sigma_flat.min():.2e}, max={sigma_flat.max():.2e}")
+                
+                # Find next best point
+                next_idx = np.argmax(ei)
+                next_x1 = grid_points[next_idx, 0]
+                next_x2 = grid_points[next_idx, 1]
+            else:
+                utility = None
+                next_x1, next_x2 = None, None
+        else:
+            # Prior prediction
+            mu = np.zeros((n_grid, n_grid))
+            sigma = np.ones((n_grid, n_grid))
+            utility = None
+            next_x1, next_x2 = None, None
+        
+        # COLUMN 1: GP Mean
+        ax1 = axes[row_idx, 0]
+        contour1 = ax1.contourf(X1, X2, mu, levels=20, cmap='viridis')
+        if len(X_obs) > 0:
+            ax1.plot(X_obs[:, 0], X_obs[:, 1], 'r.', markersize=8, label='Observations')
+            # Highlight best point
+            best_idx = np.argmax(y_obs)
+            ax1.plot(X_obs[best_idx, 0], X_obs[best_idx, 1], 'g*', markersize=15,
+                    markeredgecolor='black', markeredgewidth=1, label='Best So Far')
+        cbar1 = plt.colorbar(contour1, ax=ax1, fraction=0.046, pad=0.04)
+        cbar1.set_label('GP Mean', fontsize=10)
+        ax1.set_xlabel(param_names[0], fontsize=11)
+        ax1.set_ylabel(param_names[1], fontsize=11)
+        ax1.set_title(f'Iteration {n_iter}: GP Mean', fontsize=12, fontweight='bold')
+        if len(X_obs) > 0:
+            ax1.legend(fontsize=9, loc='upper right')
+        ax1.grid(True, alpha=0.3)
+        
+        # COLUMN 2: GP Uncertainty
+        ax2 = axes[row_idx, 1]
+        contour2 = ax2.contourf(X1, X2, sigma, levels=20, cmap='coolwarm')
+        if len(X_obs) > 0:
+            ax2.plot(X_obs[:, 0], X_obs[:, 1], 'k.', markersize=8, label='Observations')
+        cbar2 = plt.colorbar(contour2, ax=ax2, fraction=0.046, pad=0.04)
+        cbar2.set_label('Std Dev', fontsize=10)
+        ax2.set_xlabel(param_names[0], fontsize=11)
+        ax2.set_ylabel(param_names[1], fontsize=11)
+        ax2.set_title(f'Iteration {n_iter}: GP Uncertainty', fontsize=12, fontweight='bold')
+        if len(X_obs) > 0:
+            ax2.legend(fontsize=9, loc='upper right')
+        ax2.grid(True, alpha=0.3)
+        
+        # COLUMN 3: Acquisition Function
+        ax3 = axes[row_idx, 2]
+        if utility is not None:
+            contour3 = ax3.contourf(X1, X2, utility, levels=20, cmap='plasma')
+            ax3.plot(X_obs[:, 0], X_obs[:, 1], 'w.', markersize=8, alpha=0.7, label='Observations')
+            if next_x1 is not None:
+                ax3.plot(next_x1, next_x2, 'y*', markersize=18,
+                        markeredgecolor='k', markeredgewidth=1.5,
+                        label='Next Sample')
+            cbar3 = plt.colorbar(contour3, ax=ax3, fraction=0.046, pad=0.04)
+            cbar3.set_label('EI', fontsize=10)
+            ax3.legend(fontsize=9, loc='upper right')
+        else:
+            ax3.text(0.5, 0.5, 'No acquisition\n(prior only)', 
+                    ha='center', va='center', transform=ax3.transAxes,
+                    fontsize=14, color='gray')
+        
+        ax3.set_xlabel(param_names[0], fontsize=11)
+        ax3.set_ylabel(param_names[1], fontsize=11)
+        ax3.set_title(f'Iteration {n_iter}: Acquisition (EI)', fontsize=12, fontweight='bold')
+        ax3.grid(True, alpha=0.3)
+    
+    # Overall title
+    fig.suptitle(f'{stage_name.upper()} Loop: Bayesian Optimization Progression (2D)', 
+                 fontsize=16, fontweight='bold', y=0.998)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    filename = f'bo_progression_2d_{stage_name}.png'
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    print(f"  ✓ Saved: {filename}")
+    plt.close()
+    
+    return fig
+
+
+def plot_bo_progression_1d(optimizer, stage_name='inner', param_to_vary='log10_Kp_v', 
+                           iterations_to_show=[0, 5, 15, 30, 50], 
+                           acquisition_func=None, best_gains=None):
+    """
+    Create a progression plot showing GP evolution through iterations (1D slices).
+    
+    Similar to: https://github.com/bayesian-optimization/BayesianOptimization/blob/master/docsrc/static/bo_example.png
+    
+    Shows multiple snapshots of the optimization process with GP mean, uncertainty,
+    and acquisition function at different iteration milestones. This is much more
+    informative than the final converged state where EI ≈ 0.
+    
+    Args:
+        optimizer: BayesianOptimization instance
+        stage_name: 'inner' or 'outer'
+        param_to_vary: Which parameter to vary (the other is fixed at optimal)
+        iterations_to_show: List of iteration milestones to visualize
+        acquisition_func: The acquisition function object (for EI calculation)
+        best_gains: Dict with best gain values to fix the other parameter
+    """
+    if param_to_vary not in optimizer._space.keys:
+        print(f"  Warning: {param_to_vary} not in parameter space")
+        return None
+    
+    # Get parameter bounds
+    param_names = list(optimizer._space.keys)
+    bounds = optimizer._space.bounds
+    
+    param_idx = param_names.index(param_to_vary)
+    param_bounds = bounds[param_idx]
+    
+    # Create 1D grid for the parameter we're varying
+    x_plot = np.linspace(param_bounds[0], param_bounds[1], 300).reshape(-1, 1)
+    
+    # Fix other parameter at its best value
+    other_param_idx = 1 - param_idx  # 0 -> 1, 1 -> 0
+    
+    # Determine the fixed value for the other parameter
+    # NOTE: We use the OPTIMAL value from best_gains
+    # This can result in FLAT slices if cost is insensitive to param_to_vary when other is optimal
+    # Alternative: Use np.mean(bounds[other_param_idx]) for more variation (but less relevant slice)
+    if best_gains:
+        if param_to_vary == 'log10_Kp_v':
+            other_param_value = np.log10(best_gains.get('Ki_v', 1700))
+        elif param_to_vary == 'log10_Ki_v':
+            other_param_value = np.log10(best_gains.get('Kp_v', 600))
+        elif param_to_vary == 'log10_Kp_x':
+            other_param_value = np.log10(best_gains.get('Ki_x', 20))
+        elif param_to_vary == 'log10_Ki_x':
+            other_param_value = np.log10(best_gains.get('Kp_x', 0.1))
+        else:
+            other_param_value = np.mean(bounds[other_param_idx])
+    else:
+        other_param_value = np.mean(bounds[other_param_idx])
+    
+    # Create 2D grid for GP prediction (1D slice through 2D space)
+    X_plot = np.zeros((len(x_plot), 2))
+    X_plot[:, param_idx] = x_plot.flatten()
+    X_plot[:, other_param_idx] = other_param_value
+    
+    # Filter iterations to those that actually exist
+    max_iter = len(optimizer.res)
+    iterations_to_show = [i for i in iterations_to_show if i <= max_iter]
+    
+    if not iterations_to_show:
+        print(f"  Warning: No valid iterations to show for {stage_name}")
+        return None
+    
+    # Create figure with subplots (2 columns: GP + Acquisition)
+    n_rows = len(iterations_to_show)
+    fig, axes = plt.subplots(n_rows, 2, figsize=(16, 4*n_rows))
+    
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    
+    for row_idx, n_iter in enumerate(iterations_to_show):
+        # Get data up to this iteration
+        if n_iter == 0:
+            # Just show prior (no data)
+            X_obs = np.array([]).reshape(0, 2)
+            y_obs = np.array([])
+        else:
+            res_subset = optimizer.res[:n_iter]
+            X_obs = np.array([[res["params"][pname] for pname in param_names] 
+                             for res in res_subset])
+            y_obs = np.array([res["target"] for res in res_subset])
+        
+        # Fit GP with data up to this iteration
+        if len(X_obs) > 0:
+            temp_gp = clone(optimizer._gp)
+            temp_gp.fit(X_obs, y_obs)
+        else:
+            temp_gp = clone(optimizer._gp)
+        
+        # Predict on 1D slice
+        if len(X_obs) > 0:
+            mu, sigma = temp_gp.predict(X_plot, return_std=True)
+        else:
+            # Prior prediction
+            mu = np.zeros(len(X_plot))
+            sigma = np.ones(len(X_plot))
+        
+        # Check if posterior is relatively flat (low variation)
+        if len(X_obs) > 0 and row_idx == len(iterations_to_show) - 1:  # Check on last iteration
+            mu_range = mu.max() - mu.min()
+            if mu_range < 0.01:  # Very flat
+                print(f"    Note: {param_to_vary} slice is relatively flat (range={mu_range:.6f})")
+                print(f"          This suggests low sensitivity when {param_names[other_param_idx]} is fixed at optimal")
+        
+        # Convert negative target back to cost (remember we maximize -J)
+        mu_cost = -mu
+        
+        # Get observed points on this 1D slice (only show points NEAR the slice)
+        # Calculate distance from slice in the other dimension
+        if len(X_obs) > 0:
+            # Calculate how far each observation is from the slice
+            other_param_range = param_bounds[1] - param_bounds[0] if param_idx == 0 else bounds[0][1] - bounds[0][0]
+            threshold = 0.15 * other_param_range  # Only show points within 15% of range
+            
+            distances_from_slice = np.abs(X_obs[:, other_param_idx] - other_param_value)
+            near_slice_mask = distances_from_slice < threshold
+            
+            obs_on_slice = X_obs[near_slice_mask, param_idx]
+            obs_costs = -y_obs[near_slice_mask]  # Convert back to cost
+            
+            # Also mark ALL observations faintly to show the 2D distribution
+            all_obs_on_axis = X_obs[:, param_idx]
+            all_obs_costs = -y_obs
+        else:
+            obs_on_slice = np.array([])
+            obs_costs = np.array([])
+            all_obs_on_axis = np.array([])
+            all_obs_costs = np.array([])
+        
+        # LEFT PANEL: GP Mean + Uncertainty
+        ax_gp = axes[row_idx, 0]
+        
+        # Plot GP mean
+        ax_gp.plot(x_plot, mu_cost, 'b-', lw=2, label='GP Mean')
+        
+        # Plot uncertainty bands (±2 sigma = 95% confidence)
+        ax_gp.fill_between(
+            x_plot.flatten(),
+            mu_cost - 2*sigma,
+            mu_cost + 2*sigma,
+            alpha=0.3,
+            color='blue',
+            label='95% Confidence'
+        )
+        
+        # Plot ALL observed points (faintly, to show 2D distribution projected to 1D)
+        if len(all_obs_on_axis) > 0:
+            ax_gp.plot(all_obs_on_axis, all_obs_costs, 'o', 
+                      color='lightcoral', markersize=4, alpha=0.3,
+                      label='All Obs (projected)', zorder=3)
+        
+        # Plot observed points NEAR this slice (these are relevant!)
+        if len(obs_on_slice) > 0:
+            ax_gp.plot(obs_on_slice, obs_costs, 'ro', markersize=8, 
+                      label='Obs Near Slice', zorder=5)
+            
+            # Highlight best point so far (among near-slice observations)
+            best_idx = np.argmin(obs_costs)
+            ax_gp.plot(obs_on_slice[best_idx], obs_costs[best_idx], 
+                      'g*', markersize=15, markeredgecolor='black', markeredgewidth=1,
+                      label='Best Near Slice', zorder=6)
+        
+        ax_gp.set_xlabel(param_to_vary, fontsize=12)
+        ax_gp.set_ylabel('Cost J', fontsize=12)
+        
+        # Create informative title showing the fixed parameter value
+        other_param_name = param_names[other_param_idx].replace('log10_', '')
+        fixed_param_value = 10 ** other_param_value
+        title_text = f'Iteration {n_iter}: GP Posterior (fixing {other_param_name}={fixed_param_value:.1f})'
+        ax_gp.set_title(title_text, fontsize=14, fontweight='bold')
+        
+        ax_gp.legend(loc='upper right', fontsize=9)
+        ax_gp.grid(True, alpha=0.3)
+        ax_gp.set_xlim(param_bounds)
+        
+        # RIGHT PANEL: Acquisition Function
+        ax_acq = axes[row_idx, 1]
+        
+        if acquisition_func and len(X_obs) > 0:
+            # Calculate acquisition function (Expected Improvement)
+            y_max = y_obs.max()
+            
+            # Manually calculate EI
+            with np.errstate(divide='warn', invalid='ignore'):
+                imp = mu - y_max - acquisition_func.xi
+                Z = imp / sigma
+                ei = imp * norm.cdf(Z) + sigma * norm.pdf(Z)
+                ei[sigma == 0.0] = 0.0
+            
+            ax_acq.plot(x_plot, ei, 'purple', lw=2, label='Expected Improvement')
+            ax_acq.fill_between(x_plot.flatten(), 0, ei, alpha=0.3, color='purple')
+            
+            # Mark next sampling point (argmax of EI)
+            next_idx = np.argmax(ei)
+            ax_acq.plot(x_plot[next_idx], ei[next_idx], 'r*', markersize=15, 
+                       markeredgecolor='black', markeredgewidth=1,
+                       label='Next Sample', zorder=5)
+            
+            ax_acq.set_ylabel('EI Value', fontsize=12)
+            ax_acq.legend(loc='upper right', fontsize=10)
+        else:
+            ax_acq.text(0.5, 0.5, 'No acquisition\n(prior only)', 
+                       ha='center', va='center', transform=ax_acq.transAxes,
+                       fontsize=14, color='gray')
+            ax_acq.set_ylabel('Acquisition', fontsize=12)
+        
+        ax_acq.set_xlabel(param_to_vary, fontsize=12)
+        ax_acq.set_title(f'Iteration {n_iter}: Acquisition Function', fontsize=14, fontweight='bold')
+        ax_acq.grid(True, alpha=0.3)
+        ax_acq.set_xlim(param_bounds)
+    
+    # Overall title
+    param_label = param_to_vary.replace('log10_', '')
+    other_param_label = param_names[other_param_idx].replace('log10_', '')
+    fixed_val = 10 ** other_param_value
+    
+    title_main = f'{stage_name.upper()} Loop: BO Progression for {param_label}'
+    title_sub = f'(1D slice: fixing {other_param_label}={fixed_val:.1f})'
+    
+    # Add explanation if slice appears flat
+    if len(iterations_to_show) > 0 and hasattr(fig, '_flatness_note'):
+        title_sub += '\nNote: Flat posterior indicates low sensitivity to this parameter when other is at optimal'
+    
+    fig.suptitle(f'{title_main}\n{title_sub}', 
+                 fontsize=16, fontweight='bold', y=0.998)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    param_short = param_to_vary.replace('log10_', '')
+    filename = f'bo_progression_{stage_name}_{param_short}.png'
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    print(f"  ✓ Saved: {filename}")
+    plt.close()
+    
+    return fig
+
+
 if __name__ == "__main__":
     # System parameters
     params = MSDParams(mass=20.0, damping=20.0, stiffness=0.0)
@@ -1381,28 +1916,29 @@ if __name__ == "__main__":
     # Simulation config for RK4
     cfg = SimConfig(t0=0.0, tf=10.0, dt=0.05, x0=0.0, v0=0.0)
 
+    # Only necessary for manually single PID controller
     # Standard tune guide for PID:
     # Increase Kp until response with minor overshoot
     # Add Ki to remove steady-state error
     # Add Kd to dampen overshoot (set deriv_tau ~ 1–5*dt for smoothing)
     pid_p = PID(Kp=600.0, Ki=60.0, Kd=10.0, u_min=-50.0, u_max=50.0, deriv_tau=0.002)   # position PID
-    pid_v = PID(Kp=600.0, Ki=9400.0, Kd=0.0, u_min=-50.0, u_max=50.0, deriv_tau=0.005)    # velocity PID
+    pid_v = PID(Kp=600.0, Ki=2000.0, Kd=0.0, u_min=-50.0, u_max=50.0, deriv_tau=0.005)    # velocity PID
     
     # Cascade PID controller (outer loop: position, inner loop: velocity)
     cascade_pid = CascadePID(
-        outer_Kp=160.0, outer_Ki=50.0, outer_Kd=0.0,    # Position loop gains
-        inner_Kp=700.0, inner_Ki=5000.0, inner_Kd=0.0,   # Velocity loop gains
+        outer_Kp=0.8, outer_Ki=20, outer_Kd=0.0,    # Position loop gains
+        inner_Kp=565.0, inner_Ki=2500.0, inner_Kd=0.0,   # Velocity loop gains
         u_min=-50.0, u_max=50.0,
         outer_deriv_tau=0.002, inner_deriv_tau=0.005,
         velocity_limit=(-2.0, 2.0)  # Optional velocity saturation
     )
 
     # Initialize controller evaluator for performance metrics
-    evaluator = ControlEvaluator()
+    evaluator = ControllerMetrics()
 
     # Choose what to run
     # Set to "open-loop", "position", "velocity", "cascade", "velocity-setpoint", "comparison", or "bayesian_optimization"
-    run_mode = "bayesian_optimization"
+    run_mode = "velocity-setpoint"
 
     # Initialize MSD
     msd = MassSpringDamper(params, force_fn=lambda t: 0.0)  # force is provided by the PID in closed-loop
@@ -1443,7 +1979,7 @@ if __name__ == "__main__":
     
     elif run_mode == "velocity":
         # Velocity control example
-        ref_v = step_ref(magnitude=0.3, t_delay=0.5)  # 0.5 m/s
+        ref_v = step_ref(magnitude=0.2, t_delay=0.5)  # 0.5 m/s
         t, x, v, u, E, KE, PE, r_hist = msd.simulate_closed_loop(cfg, pid_v, ref_fn=ref_v, mode="velocity")
         plot_closed_loop(t, x, v, u, E, KE, PE, r_hist, mode="velocity", params=params)
         
@@ -1501,7 +2037,7 @@ if __name__ == "__main__":
         msd.F = disturbance
         
         # Run simulation
-        test_cfg = SimConfig(t0=0.0, tf=15.0, dt=0.001, x0=0.0, v0=0.0)
+        test_cfg = SimConfig(t0=0.0, tf=15.0, dt=0.05, x0=0.0, v0=0.0)
         
         t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist = msd.simulate_cascade_loop(
             test_cfg, cascade_pid, ref_fn=reference, mode=control_mode, use_feedforward=True
@@ -1566,7 +2102,7 @@ if __name__ == "__main__":
     
     elif run_mode == "velocity-setpoint":
         # Direct velocity setpoint control (bypass position loop)
-        ref_v = step_ref(magnitude=0.3, t_delay=1.0)  # 0.3 m/s step at t=1.0s
+        ref_v = step_ref(magnitude=0.2, t_delay=.5) 
         t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist = msd.simulate_cascade_loop(
             cfg, cascade_pid, ref_fn=ref_v, mode="velocity", use_feedforward=False
         )
@@ -1583,6 +2119,30 @@ if __name__ == "__main__":
         )
         evaluator.print_metrics(metrics)
         
+        # Compute cost using the same weights as Bayesian Optimization
+        weights_cfg = {
+            'weights': {
+                'rise_time': 0.25,
+                'settling_time': 0.35,
+                'overshoot': 0.20,
+                'sse': 0.20
+            },
+            'normalization_refs': {
+                'rise_time': 1.0,
+                'settling_time': 5.0,
+                'overshoot': 20.0,
+                'sse': 0.01
+            },
+            'use_worst_case': False
+        }
+        
+        J = evaluator.cost_from_metrics(
+            [metrics],  # Single scenario, wrap in list
+            weights=weights_cfg['weights'],
+            normalization_refs=weights_cfg['normalization_refs'],
+            use_worst_case=weights_cfg['use_worst_case']
+        )
+        
         # Plot error analysis for velocity tracking
         error = v_ref_hist - v
         evaluator.plot_error_analysis(t, v, v_ref_hist, error)
@@ -1592,6 +2152,7 @@ if __name__ == "__main__":
         print("Position loop: DISABLED (direct velocity control)")
         if cascade_pid.velocity_limit:
             print(f"Velocity limits: {cascade_pid.velocity_limit} m/s")
+        print(f"\n**Cost J = {J:.6f}**")
     
     elif run_mode == "comparison":  # compare controllers
         # Run position control
@@ -1676,14 +2237,16 @@ if __name__ == "__main__":
         
         bounds_log10 = {
             # Inner loop (velocity PI): tune first
+            # VALIDATION TEST: Bounds include known optimal (Kp=600, Ki=1700)
             'inner': {
-            'log10_Kp_v': [-1.0, 4.0],   # log10(Kp_v) ∈ [-1.0, 4.0] => Kp_v ∈ [0.1, 10000]
-            'log10_Ki_v': [-1.0, 4.0],   # log10(Ki_v) ∈ [-1.0, 4.0] => Ki_v ∈ [0.1, 10000]
+            'log10_Kp_v': [2.0, 3.0],   # log10(Kp_v) ∈ [2.0, 3.0] => Kp_v ∈ [100, 1000]
+            'log10_Ki_v': [3.0, 3.4],   # log10(Ki_v) ∈ [3.0, 3.4] => Ki_v ∈ [1000, 2512]
             },
             # Outer loop (position PI): tune second with fixed inner loop
+            # VALIDATION TEST: Bounds include known optimal (Kp=0.1, Ki=20)
             'outer': {
-            'log10_Kp_x': [-1.0, 3.0],   # log10(Kp_x) ∈ [-1.0, 3.0] => Kp_x ∈ [0.1, 1000]
-            'log10_Ki_x': [-10.0, 2.0],  # log10(Ki_x) ∈ [-10.0, 2.0] => Ki_x ∈ [1e-10, 100]
+            'log10_Kp_x': [-1.3, -0.5],  # log10(Kp_x) ∈ [-1.3, -0.5] => Kp_x ∈ [0.05, 0.32]
+            'log10_Ki_x': [1.0, 1.6],    # log10(Ki_x) ∈ [1.0, 1.6] => Ki_x ∈ [10, 40]
             },
             # Joint optimization: fine-tune all four gains together
             'joint': {
@@ -1693,7 +2256,7 @@ if __name__ == "__main__":
                 'log10_Ki_x': [-1.0, 2.0],
             }
         }
-        
+    
         # Cost function weights (prioritize fast settling and accuracy)
         weights_cfg = {
             'weights': {
@@ -1715,7 +2278,7 @@ if __name__ == "__main__":
         safety_cfg = {
             'max_saturation': 90.0,   # Allow up to 90% saturation
             'max_energy': 1e5,        # Energy divergence threshold
-            'max_position': 20.0       # Position envelope [m]
+            'max_position': 20.0      # Position envelope [m]
         }
         
         print("Configuration:")
@@ -1723,7 +2286,7 @@ if __name__ == "__main__":
         print(f"  Safety: max_sat={safety_cfg['max_saturation']}%, max_E={safety_cfg['max_energy']:.1e}, max_x={safety_cfg['max_position']}m")
         print()
         
-        # 3. CREATE BOEvaluator
+        # 3. CREATE BayesianOptimizer
         
         # initial gains - will be overwritten by BO
         opt_cascade_pid = CascadePID(
@@ -1736,8 +2299,8 @@ if __name__ == "__main__":
         # Simulation config for optimization (long time to ensure even slow controllers can settle)
         opt_sim_cfg = SimConfig(t0=0.0, tf=10.0, dt=0.05, x0=0.0, v0=0.0)
         
-        # Create BOEvaluator
-        bo_evaluator = BOEvaluator(
+        # Create BayesianOptimizer
+        optimizer = BayesianOptimizer(
             plant=msd,
             controller=opt_cascade_pid,
             evaluator=evaluator,
@@ -1749,28 +2312,34 @@ if __name__ == "__main__":
             rng=np.random.RandomState(42)  # Reproducibility
         )
         
-        print("BOEvaluator created successfully\n")
+        print("BayesianOptimizer created successfully\n")
         
         # 4. STAGE 1: OPTIMIZE INNER LOOP (VELOCITY)
+        #
+        # Acquisition Strategy:
+        # - Using Expected Improvement (EI) with xi=0.01
+        # - Manual optimization loop using suggest() and probe()
+        # - EI provides faster convergence and focuses on exploitation
 
         print("="*80)
         print("STAGE 1: INNER LOOP OPTIMIZATION (Velocity PI Gains)")
         print("="*80 + "\n")
         
-        bo_evaluator.set_stage('inner')
+        optimizer.set_stage('inner')
         
         # Manual seed points (good starting guesses in log10 space)
-        # Centered around Kp=100.0, Ki=50.0
+        # VALIDATION TEST: Seeds distributed around the space (NOT at optimal 600/1700)
         inner_seeds = [
-            {'log10_Kp_v': 3.0, 'log10_Ki_v': 4.0},   # Kp=1000, Ki=10000 (baseline)
-            {'log10_Kp_v': 2.8, 'log10_Ki_v': 3.7},   # Kp=630, Ki=5000 (lower)
-            {'log10_Kp_v': 3.2, 'log10_Ki_v': 4.3},   # Kp=1600, Ki=20000 (higher)
+            {'log10_Kp_v': np.log10(200), 'log10_Ki_v': np.log10(1000)},   # Lower-left region
+            {'log10_Kp_v': np.log10(800), 'log10_Ki_v': np.log10(2500)},   # Upper-right region
+            # {'log10_Kp_v': np.log10(450), 'log10_Ki_v': np.log10(1800)},   # Middle region
+            # {'log10_Kp_v': np.log10(700), 'log10_Ki_v': np.log10(1200)},   # Asymmetric 1
         ]
         
         # Create Bayesian Optimization object for inner loop
         # Note: We maximize -J (negative cost) since BO maximizes
         inner_optimizer = BayesianOptimization(
-            f=bo_evaluator,  # Callable that returns -J
+            f=optimizer,  # Callable that returns -J
             pbounds=bounds_log10['inner'],
             random_state=42,
             allow_duplicate_points=False
@@ -1780,8 +2349,9 @@ if __name__ == "__main__":
         from sklearn.gaussian_process.kernels import Matern
         inner_optimizer.set_gp_params(
             kernel=Matern(nu=2.5, length_scale=[1.0, 1.0], length_scale_bounds=[(0.1, 10.0), (0.1, 10.0)]),
-            alpha=1e-4,  # Noise level (small for deterministic sims)
-            n_restarts_optimizer=5
+            alpha=1e-6,  # VERY low noise = GP is VERY confident = follows observations EXACTLY
+                        # Higher alpha (e.g., 1e-5 or 1e-4) = less confident GP = maintains higher EI longer
+            n_restarts_optimizer=25  # More restarts = better GP hyperparameter optimization
         )
         
         # Add manual seed points
@@ -1795,16 +2365,60 @@ if __name__ == "__main__":
         
         print()
         
-        # Run Bayesian Optimization
+        # Run Bayesian Optimization with Expected Improvement
         print("Running Bayesian Optimization...")
-        print(f"  Initial random points: 5")
-        print(f"  Optimization iterations: 25")
+        print(f"  Initial random points: 2 (reduced for better EI visualization)")
+        print(f"  Optimization iterations: 50")
+        print(f"  Acquisition function: Expected Improvement (EI, xi=0.1)")
         print()
         
-        inner_optimizer.maximize(
-            init_points=5,      # Additional random initialization
-            n_iter=25           # Number of BO iterations
-        )
+        # Create Expected Improvement acquisition function
+        # Per docs: xi=0.0 is pure exploitation, xi=0.1 is high exploration
+        # 
+        # IMPORTANT: xi controls exploration vs exploitation tradeoff
+        # - xi=0.01 (current): FAST convergence, minimal exploration
+        #   Good for: tight bounds, quick optimization, limited budget
+        # - xi=0.05: More exploration, slower convergence
+        # - xi=0.1: High exploration, much slower convergence
+        #
+        # NOTE: With tight bounds ([100,1000], [1000,2512]) and 57 evaluations,
+        # EI converges to ~0 around iteration 15-20 because:
+        # 1. Small search space (narrow bounds)
+        # 2. Low xi = exploitation-heavy
+        # 3. Many evaluations relative to space size
+        # 4. Low GP noise (alpha=1e-6) = high confidence
+        #
+        # To maintain higher EI for longer:
+        # - Increase xi to 0.05 or 0.1 (more exploration)
+        # - Widen bounds (larger search space)
+        # - Reduce iterations (stop earlier)
+        # - Increase alpha to 1e-5 or 1e-4 (less confident GP)
+        ei_acquisition = ExpectedImprovement(xi=0.1)
+        
+        # Manual optimization loop with EI acquisition
+        # Random initialization for diverse starting points
+        # REDUCED from 5 to 2 to better visualize EI convergence
+        for _ in range(2):
+            next_point_dict = inner_optimizer._space.random_sample()
+            inner_optimizer.probe(next_point_dict, lazy=False)
+        
+        # Then do BO iterations with EI
+        for i in range(50):
+            # Get next point using EI acquisition
+            next_point_array = ei_acquisition.suggest(
+                gp=inner_optimizer._gp,
+                target_space=inner_optimizer._space,
+                n_random=5000,  # More samples for better acquisition optimization
+                n_smart=10      # More L-BFGS-B refinement starts
+            )
+            # Convert array to dict using pbounds keys to preserve order
+            param_names = list(bounds_log10['inner'].keys())
+            next_point_dict = {param_names[j]: next_point_array[j] for j in range(len(param_names))}
+            inner_optimizer.probe(next_point_dict, lazy=False)
+            if (i + 1) % 10 == 0:
+                print(f"  Iteration {i + 1}/50 complete")
+        
+        print()
         
         # Extract best inner loop gains
         best_inner = inner_optimizer.max
@@ -1829,20 +2443,21 @@ if __name__ == "__main__":
         print("="*80 + "\n")
         
         # Switch to outer loop scenarios
-        bo_evaluator.scenarios = outer_scenarios
-        bo_evaluator.set_stage('outer')
+        optimizer.scenarios = outer_scenarios
+        optimizer.set_stage('outer')
         
         # Manual seed points for outer loop
-        # Centered around Kp=50.0, Ki=10.0
+        # VALIDATION TEST: Seeds distributed around the space (NOT at optimal 0.1/20)
         outer_seeds = [
-            {'log10_Kp_x': 2.0, 'log10_Ki_x': 2.0},   # Kp=100, Ki=100 (baseline)
-            {'log10_Kp_x': 1.8, 'log10_Ki_x': 1.8},   # Kp=63, Ki=63 (lower)
-            {'log10_Kp_x': 2.2, 'log10_Ki_x': 2.2},   # Kp=158, Ki=158 (higher)
+            {'log10_Kp_x': np.log10(0.05), 'log10_Ki_x': np.log10(10)},   # Lower region
+            {'log10_Kp_x': np.log10(0.3), 'log10_Ki_x': np.log10(40)},    # Upper region  
+            {'log10_Kp_x': np.log10(0.15), 'log10_Ki_x': np.log10(25)},   # Middle region
+            {'log10_Kp_x': np.log10(0.2), 'log10_Ki_x': np.log10(15)},    # Asymmetric
         ]
         
         # Create optimizer for outer loop
         outer_optimizer = BayesianOptimization(
-            f=bo_evaluator,
+            f=optimizer,
             pbounds=bounds_log10['outer'],
             random_state=43,
             allow_duplicate_points=False
@@ -1851,8 +2466,8 @@ if __name__ == "__main__":
         # Configure GP
         outer_optimizer.set_gp_params(
             kernel=Matern(nu=2.5, length_scale=[1.0, 1.0], length_scale_bounds=[(0.1, 10.0), (0.1, 10.0)]),
-            alpha=1e-4,
-            n_restarts_optimizer=5
+            alpha=1e-3,  # Lower noise = GP more confident = follows observations closely
+            n_restarts_optimizer=25  # More restarts = better GP hyperparameter optimization
         )
         
         # Probe seed points
@@ -1866,16 +2481,41 @@ if __name__ == "__main__":
         
         print()
         
-        # Run optimization
+        # Run optimization with Expected Improvement
         print("Running Bayesian Optimization...")
         print(f"  Initial random points: 5")
-        print(f"  Optimization iterations: 25")
+        print(f"  Optimization iterations: 40")
+        print(f"  Acquisition function: Expected Improvement (EI, xi=0.01)")
         print()
         
-        outer_optimizer.maximize(
-            init_points=5,
-            n_iter=25
-        )
+        # Create Expected Improvement acquisition function
+        # Per docs: xi=0.01 provides minimal exploration with gradual convergence
+        ei_acquisition_outer = ExpectedImprovement(xi=0.1)
+        
+        # Manual optimization loop with EI acquisition
+        # Random initialization for diverse starting points
+        # REDUCED from 5 to 2 to better visualize EI convergence
+        for _ in range(2):
+            next_point_dict = outer_optimizer._space.random_sample()
+            outer_optimizer.probe(next_point_dict, lazy=False)
+        
+        # Then do BO iterations with EI
+        for i in range(40):
+            # Get next point using EI acquisition
+            next_point_array = ei_acquisition_outer.suggest(
+                gp=outer_optimizer._gp,
+                target_space=outer_optimizer._space,
+                n_random=5000,  # More samples for better optimization
+                n_smart=10      # More L-BFGS-B starts
+            )
+            # Convert array to dict using pbounds keys to preserve order
+            param_names = list(bounds_log10['outer'].keys())
+            next_point_dict = {param_names[j]: next_point_array[j] for j in range(len(param_names))}
+            outer_optimizer.probe(next_point_dict, lazy=False)
+            if (i + 1) % 10 == 0:
+                print(f"  Iteration {i + 1}/40 complete")
+        
+        print()
         
         # Extract best outer loop gains
         best_outer = outer_optimizer.max
@@ -1900,7 +2540,7 @@ if __name__ == "__main__":
         # print("STAGE 3: JOINT OPTIMIZATION (All Four PI Gains)")
         # print("="*80 + "\n")
         #
-        # bo_evaluator.set_stage('joint')
+        # optimizer.set_stage('joint')
         #
         # # Seed with best from previous stages
         # joint_seeds = [
@@ -1914,7 +2554,7 @@ if __name__ == "__main__":
         #
         # # Create optimizer for joint optimization
         # joint_optimizer = BayesianOptimization(
-        #     f=bo_evaluator,
+        #     f=optimizer,
         #     pbounds=bounds_log10['joint'],
         #     random_state=44,
         #     allow_duplicate_points=False
@@ -1980,7 +2620,38 @@ if __name__ == "__main__":
         print("OPTIMIZATION SUMMARY")
         print("="*80 + "\n")
         
-        bo_evaluator.print_best()
+        optimizer.print_best()
+        
+        # Visualize GP and Acquisition Function
+        print("\nGenerating GP and Utility Function visualizations...")
+        plot_gp_and_acquisition_2d(inner_optimizer, stage_name='inner', 
+                                    param_names=['log10_Kp_v', 'log10_Ki_v'],
+                                    acquisition_func=ei_acquisition)
+        plot_gp_and_acquisition_2d(outer_optimizer, stage_name='outer',
+                                    param_names=['log10_Kp_x', 'log10_Ki_x'],
+                                    acquisition_func=ei_acquisition_outer)
+        
+        # Generate BO progression plots (2D contours showing evolution)
+        print("\nGenerating BO progression visualizations (2D contours)...")
+        plot_bo_progression_2d(inner_optimizer, 'inner', 
+                              param_names=['log10_Kp_v', 'log10_Ki_v'],
+                              iterations_to_show=[2, 4, 7, 15, 30, 50], 
+                              acquisition_func=ei_acquisition)
+        plot_bo_progression_2d(outer_optimizer, 'outer',
+                              param_names=['log10_Kp_x', 'log10_Ki_x'],
+                              iterations_to_show=[2, 4, 7, 15, 30, 40], 
+                              acquisition_func=ei_acquisition_outer)
+        
+        # Generate 1D progression plots (slices showing EI convergence clearly)
+        print("\nGenerating 1D progression visualizations (showing EI convergence)...")
+        plot_bo_progression_1d(inner_optimizer, 'inner', 'log10_Kp_v', 
+                              [2, 4, 7, 15, 30, 50], ei_acquisition, best_inner_gains)
+        plot_bo_progression_1d(inner_optimizer, 'inner', 'log10_Ki_v', 
+                              [2, 4, 7, 15, 30, 50], ei_acquisition, best_inner_gains)
+        plot_bo_progression_1d(outer_optimizer, 'outer', 'log10_Kp_x', 
+                              [2, 4, 7, 15, 30, 40], ei_acquisition_outer, best_outer_gains)
+        plot_bo_progression_1d(outer_optimizer, 'outer', 'log10_Ki_x', 
+                              [2, 4, 7, 15, 30, 40], ei_acquisition_outer, best_outer_gains)
         
         # Plot convergence for each stage
         fig, axs = plt.subplots(2, 1, figsize=(10, 8))
@@ -1994,7 +2665,7 @@ if __name__ == "__main__":
         
         axs[0].plot(inner_targets, 'b-o', markersize=4)
         axs[0].axhline(y=min_J_inner, color='r', linestyle='--', label=f'Best J={min_J_inner:.4f}')
-        axs[0].set_ylim([0, 5])  # Limit y-axis to filter extreme values
+        axs[0].set_ylim([0, 0.7])  # Limit y-axis to filter extreme values
         axs[0].set_ylabel('Cost J')
         axs[0].set_title('Stage 1: Inner Loop (Velocity) Convergence')
         axs[0].grid(True, alpha=0.3)
@@ -2008,7 +2679,7 @@ if __name__ == "__main__":
         
         axs[1].plot(outer_targets, 'g-o', markersize=4)
         axs[1].axhline(y=min_J_outer, color='r', linestyle='--', label=f'Best J={min_J_outer:.4f}')
-        axs[1].set_ylim([0, 5])  # Limit y-axis
+        axs[1].set_ylim([0, 0.7])  # Limit y-axis
         axs[1].set_ylabel('Cost J')
         axs[1].set_xlabel('Iteration')
         axs[1].set_title('Stage 2: Outer Loop (Position) Convergence')
@@ -2045,7 +2716,7 @@ if __name__ == "__main__":
         )
         
         # Run a longer validation simulation
-        val_cfg = SimConfig(t0=0.0, tf=15.0, dt=0.001, x0=0.0, v0=0.0)
+        val_cfg = SimConfig(t0=0.0, tf=15.0, dt=0.05, x0=0.0, v0=0.0)
         ref_val = Scenario.step_position(magnitude=0.15, t_start=1.0)  # Simple step for clear metrics
         
         t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist = msd.simulate_cascade_loop(
