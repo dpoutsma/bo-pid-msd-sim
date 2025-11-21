@@ -69,7 +69,7 @@ Edit the `run_mode` variable in the main block of `msd_sim.py` to select:
 - **`"position"`**: Single-loop PID position control
 - **`"velocity"`**: Single-loop PID velocity control  
 - **`"cascade"`**: Cascade PID testing with easy mode switching (see Cascade Mode Testing below)
-- **`"velocity-setpoint"`**: Direct velocity setpoint control (bypass position loop)
+- **`"velocity-setpoint"`**: Direct velocity setpoint control (bypass position loop, includes cost calculation for optimization)
 - **`"comparison"`**: Compare multiple controllers side-by-side
 - **`"bayesian_optimization"`**: Automated PID tuning using Bayesian Optimization
 
@@ -321,7 +321,7 @@ Position Reference → [Outer PID] → Velocity Setpoint → [Inner PID] → For
 
 ## Controller Performance Evaluation
 
-The simulation includes a comprehensive `ControlEvaluator` class that automatically calculates and displays performance metrics:
+The simulation includes a comprehensive `ControllerMetrics` class that automatically calculates and displays performance metrics:
 
 ### Tracking Performance Metrics
 - **IAE (Integral Absolute Error)**: `∫|e(t)|dt` - Measures cumulative tracking error
@@ -375,7 +375,7 @@ Steady-state error: 2.17e-07   # Final residual error
 
 ### Cost Aggregation for Optimization
 
-The `ControlEvaluator` includes a `cost_from_metrics()` method that aggregates per-scenario metrics into a scalar cost J for controller optimization (e.g., Bayesian optimization):
+The `ControllerMetrics` includes a `cost_from_metrics()` method that aggregates per-scenario metrics into a scalar cost J for controller optimization (e.g., Bayesian optimization):
 
 **Pipeline**: `timeseries → metrics → normalized metrics → weighted sum → J`
 
@@ -399,7 +399,7 @@ Where:
 - `ŜSE`: Normalized steady-state error
 - `w_r, w_s, w_o, w_e`: Weights reflecting mission priorities
 
-#### Default Configuration (Defined in BOEvaluator)
+#### Default Configuration (Defined in BayesianOptimizer)
 ```python
 # Weights (should sum to 1.0)
 weights = {
@@ -418,11 +418,11 @@ normalization_refs = {
 }
 ```
 
-**Note**: `cost_from_metrics()` requires `weights` and `normalization_refs` to be explicitly passed (no defaults). The `BOEvaluator` class is the single source of truth for these configuration values.
+**Note**: `cost_from_metrics()` requires `weights` and `normalization_refs` to be explicitly passed (no defaults). The `BayesianOptimizer` class is the single source of truth for these configuration values.
 
 #### Usage Example
 ```python
-evaluator = ControlEvaluator()
+evaluator = ControllerMetrics()
 metrics_list = []
 
 # Run multiple scenarios
@@ -487,22 +487,43 @@ Max control rate:   2.156e+04
 
 ## Bayesian Optimization for PID Tuning
 
-The `BOEvaluator` class provides a complete framework for automated PID tuning using Bayesian Optimization. It manages multi-stage tuning, constraint checking, and provides a clean interface for optimization libraries.
+The `BayesianOptimizer` class provides a complete framework for automated PID tuning using Bayesian Optimization. It manages multi-stage tuning, constraint checking, and provides a clean interface for optimization libraries.
+
+### Visualization Tools
+
+The framework includes advanced visualization capabilities to understand BO behavior and Gaussian Process (GP) learning:
+
+- **2D Progression Plots** (`plot_bo_progression_2d()`): Shows evolution of GP mean, uncertainty, and Expected Improvement (EI) acquisition function across iterations as 2D contour plots. Reveals how the optimizer explores the parameter space and converges to optimal regions.
+
+- **1D Slice Analysis** (`plot_bo_progression_1d()`): Examines parameter sensitivity along single dimensions with automatic flat-region detection to identify parameter coupling and low-sensitivity directions.
+
+- **Final State Visualization** (`plot_gp_and_acquisition_2d()`): Displays final GP state and acquisition landscape after optimization completes, showing the learned surrogate model.
+
+- **EI Diagnostics**: Tracks Expected Improvement convergence statistics (min/max/mean) at each iteration. EI→0 indicates successful optimization and confidence in current optimum.
+
+#### Understanding Acquisition Function Behavior
+
+For deeper insights into optimization dynamics, see these explanation documents:
+- `EI_CONVERGENCE_EXPLAINED.md` - Why Expected Improvement converges to near-zero values (this is desired behavior)
+- `WHY_EI_STARTS_NEAR_ZERO.md` - How random initialization can find optimal quickly in tight bounds
+- `WHY_1D_SLICES_APPEAR_FLAT.md` - Understanding parameter coupling effects in 1D slice visualizations
+
+**Note**: The number of random initialization points affects convergence speed. Current configuration uses 2 random seeds before BO iterations begin. More random samples can find good solutions faster but may reduce the visibility of EI evolution in early iterations.
 
 ### Architecture: Separation of Concerns
 
-**BOEvaluator** (Constraint Checking & Safety):
+**BayesianOptimizer** (Constraint Checking & Safety):
 - Performs **early-exit** constraint checking during simulation
 - Prevents unnecessary computation for infeasible candidates
 - Handles: energy divergence, actuator saturation, position envelope, NaN/Inf detection
 - Returns large penalty (`1e6`) for constraint violations
 
-**ControlEvaluator** (Pure Metric Aggregation):
+**ControllerMetrics** (Pure Metric Aggregation):
 - Purely focused on metric normalization and cost calculation
 - NO constraint checking - assumes feasible inputs
 - Converts multi-scenario metrics into scalar cost `J`
 
-This design eliminates redundancy while maintaining safety through early exits in `BOEvaluator._run_scenarios()`.
+This design eliminates redundancy while maintaining safety through early exits in `BayesianOptimizer._run_scenarios()`.
 
 ### Constraint Checking (Safety Configuration)
 
@@ -520,7 +541,7 @@ safety_cfg = {
 }
 ```
 
-These checks happen in `BOEvaluator._run_scenarios()` **before** calling `cost_from_metrics()`, preventing wasted computation on infeasible solutions.
+These checks happen in `BayesianOptimizer._run_scenarios()` **before** calling `cost_from_metrics()`, preventing wasted computation on infeasible solutions.
 
 ### Finding Appropriate Gain Bounds
 
@@ -742,7 +763,7 @@ msd_sim.py              # Main simulation script
 ├── PID                 # Single-loop PID controller
 ├── CascadePID          # Dual-loop cascade PID controller
 ├── Scenario            # Test scenarios and disturbances generator
-├── ControlEvaluator    # Performance metrics and analysis
+├── ControllerMetrics   # Performance metrics and analysis
 └── Helper functions    # Reference signals, plotting, utilities
 requirements.txt        # Python dependencies
 README.md              # This documentation

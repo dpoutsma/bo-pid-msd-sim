@@ -1,5 +1,5 @@
 numpy
 matplotlib
 pyQT5
-bayesian-optimization>=1.4.0
+bayesian-optimization>=3.0.0
 scikit-learn>=1.0.0
