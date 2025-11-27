@@ -909,7 +909,7 @@ class BayesianOptimizer:
     """
     
     def __init__(self, plant, controller, evaluator, scenarios, bounds_log10, 
-                 weights_cfg, safety_cfg, sim_cfg=None, rng=None):
+                 weights_cfg, safety_cfg, sim_cfg=None, rng=None, scenario_generator=None):
         """
         Initialize Bayesian Optimization Evaluator.
         
@@ -940,6 +940,7 @@ class BayesianOptimizer:
                        }
             sim_cfg: SimConfig instance for simulation settings (optional)
             rng: Random number generator (for reproducibility, optional)
+            scenario_generator: Function that takes iteration count and returns scenarios (optional)
         """
         self.plant = plant
         self.controller = controller
@@ -950,6 +951,7 @@ class BayesianOptimizer:
         self.safety_cfg = safety_cfg
         self.sim_cfg = sim_cfg if sim_cfg is not None else SimConfig(tf=10.0, dt=0.05)
         self.rng = rng if rng is not None else np.random.RandomState(42)
+        self.scenario_generator = scenario_generator  # Store generator function
         
         # Store best results per stage
         self.best = {
@@ -1102,6 +1104,14 @@ class BayesianOptimizer:
                   Returns large negative value for infeasible candidates
         """
         self.eval_count += 1
+        
+        # Update scenarios if generator is provided (for alternating scenarios)
+        if self.scenario_generator is not None and self.current_stage in self.scenario_generator:
+            self.scenarios = self.scenario_generator[self.current_stage](self.eval_count)
+            direction = "NEGATIVE" if self.eval_count % 2 == 1 else "POSITIVE"
+            # Print scenario info only occasionally to avoid clutter
+            if self.eval_count <= 3 or self.eval_count % 10 == 0:
+                print(f"  [Iter {self.eval_count}: Using {direction} step scenario]")
         
         # Convert log10 parameters to actual gains
         gains = self._log10_to_gains(**log10_params)
@@ -1938,7 +1948,7 @@ if __name__ == "__main__":
 
     # Choose what to run
     # Set to "open-loop", "position", "velocity", "cascade", "velocity-setpoint", "comparison", or "bayesian_optimization"
-    run_mode = "velocity-setpoint"
+    run_mode = "bayesian_optimization"
 
     # Initialize MSD
     msd = MassSpringDamper(params, force_fn=lambda t: 0.0)  # force is provided by the PID in closed-loop
@@ -2206,32 +2216,41 @@ if __name__ == "__main__":
         # 1. DEFINE TEST SCENARIOS
         print("Setting up test scenarios...")
         
-        # Stage 1: Inner loop (velocity) test scenarios
-        inner_scenarios = [
-            # Velocity step response
-            (Scenario.step_velocity(magnitude=0.2, t_start=0.5),
-             lambda t: 0.0,
-             "velocity"),
-            
-            # Cruise with step disturbance
-            # (Scenario.cruise(velocity=0.0),
-            #  Scenario.disturbance_impulse(area=1.0, t_impulse=2.0, width=0.01),
-            #  "velocity"),
-        ]
+        # Define scenario generators that will alternate based on iteration count
+        def get_inner_scenarios(iteration):
+            """Generate inner scenarios with alternating positive/negative steps"""
+            vel_magnitude = -0.2 if iteration % 2 == 1 else 0.2
+            return [
+                (Scenario.step_velocity(magnitude=vel_magnitude, t_start=0.5),
+                 lambda t: 0.0,
+                 "velocity"),
+            ]
         
-        # Stage 2: Outer loop (position) test scenarios
-        outer_scenarios = [
-            # Position step response
-            (Scenario.step_position(magnitude=0.1, t_start=0.5),
-             lambda t: 0.0,
-             "position"),
-        ]
+        def get_outer_scenarios(iteration):
+            """Generate outer scenarios with alternating positive/negative steps"""
+            pos_magnitude = -0.1 if iteration % 2 == 1 else 0.1
+            return [
+                (Scenario.step_position(magnitude=pos_magnitude, t_start=0.5),
+                 lambda t: 0.0,
+                 "position"),
+            ]
+        
+        # Start with initial scenarios (will be updated each iteration)
+        inner_scenarios = get_inner_scenarios(0)
+        outer_scenarios = get_outer_scenarios(0)
+        
+        # Store generators for later use
+        scenario_generators = {
+            'inner': get_inner_scenarios,
+            'outer': get_outer_scenarios
+        }
         
         # Start with inner loop scenarios
         test_scenarios = inner_scenarios
         
-        print(f"  ✓ Created {len(inner_scenarios)} inner loop scenarios")
-        print(f"  ✓ Created {len(outer_scenarios)} outer loop scenarios\n")
+        print(f"  ✓ Created alternating scenario generators")
+        print(f"  ✓ Inner loop: velocity steps alternating ±0.2 m/s")
+        print(f"  ✓ Outer loop: position steps alternating ±0.1 m\n")
         
         # 2. CONFIGURE BAYESIAN OPTIMIZATION
         
@@ -2309,10 +2328,12 @@ if __name__ == "__main__":
             weights_cfg=weights_cfg,
             safety_cfg=safety_cfg,
             sim_cfg=opt_sim_cfg,
-            rng=np.random.RandomState(42)  # Reproducibility
+            rng=np.random.RandomState(42),  # Reproducibility
+            scenario_generator=scenario_generators  # Pass the generators for alternating scenarios
         )
         
         print("BayesianOptimizer created successfully\n")
+        print("  → Scenarios will alternate between positive/negative steps each iteration\n")
         
         # 4. STAGE 1: OPTIMIZE INNER LOOP (VELOCITY)
         #
@@ -2613,45 +2634,47 @@ if __name__ == "__main__":
             'Kp_x': best_outer_gains['Kp_x'],
             'Ki_x': best_outer_gains['Ki_x']
         }
-        
-        # 7. SUMMARY AND CONVERGENCE PLOTS
+       
+       # 7. SUMMARY AND CONVERGENCE PLOTS
     
         print("="*80)
         print("OPTIMIZATION SUMMARY")
         print("="*80 + "\n")
         
         optimizer.print_best()
+
+        # Temporarly commented out 27/11/25
         
-        # Visualize GP and Acquisition Function
-        print("\nGenerating GP and Utility Function visualizations...")
-        plot_gp_and_acquisition_2d(inner_optimizer, stage_name='inner', 
-                                    param_names=['log10_Kp_v', 'log10_Ki_v'],
-                                    acquisition_func=ei_acquisition)
-        plot_gp_and_acquisition_2d(outer_optimizer, stage_name='outer',
-                                    param_names=['log10_Kp_x', 'log10_Ki_x'],
-                                    acquisition_func=ei_acquisition_outer)
+        # # Visualize GP and Acquisition Function
+        # print("\nGenerating GP and Utility Function visualizations...")
+        # plot_gp_and_acquisition_2d(inner_optimizer, stage_name='inner', 
+        #                             param_names=['log10_Kp_v', 'log10_Ki_v'],
+        #                             acquisition_func=ei_acquisition)
+        # plot_gp_and_acquisition_2d(outer_optimizer, stage_name='outer',
+        #                             param_names=['log10_Kp_x', 'log10_Ki_x'],
+        #                             acquisition_func=ei_acquisition_outer)
         
-        # Generate BO progression plots (2D contours showing evolution)
-        print("\nGenerating BO progression visualizations (2D contours)...")
-        plot_bo_progression_2d(inner_optimizer, 'inner', 
-                              param_names=['log10_Kp_v', 'log10_Ki_v'],
-                              iterations_to_show=[2, 4, 7, 15, 30, 50], 
-                              acquisition_func=ei_acquisition)
-        plot_bo_progression_2d(outer_optimizer, 'outer',
-                              param_names=['log10_Kp_x', 'log10_Ki_x'],
-                              iterations_to_show=[2, 4, 7, 15, 30, 40], 
-                              acquisition_func=ei_acquisition_outer)
+        # # Generate BO progression plots (2D contours showing evolution)
+        # print("\nGenerating BO progression visualizations (2D contours)...")
+        # plot_bo_progression_2d(inner_optimizer, 'inner', 
+        #                       param_names=['log10_Kp_v', 'log10_Ki_v'],
+        #                       iterations_to_show=[2, 4, 7, 15, 30, 50], 
+        #                       acquisition_func=ei_acquisition)
+        # plot_bo_progression_2d(outer_optimizer, 'outer',
+        #                       param_names=['log10_Kp_x', 'log10_Ki_x'],
+        #                       iterations_to_show=[2, 4, 7, 15, 30, 40], 
+        #                       acquisition_func=ei_acquisition_outer)
         
-        # Generate 1D progression plots (slices showing EI convergence clearly)
-        print("\nGenerating 1D progression visualizations (showing EI convergence)...")
-        plot_bo_progression_1d(inner_optimizer, 'inner', 'log10_Kp_v', 
-                              [2, 4, 7, 15, 30, 50], ei_acquisition, best_inner_gains)
-        plot_bo_progression_1d(inner_optimizer, 'inner', 'log10_Ki_v', 
-                              [2, 4, 7, 15, 30, 50], ei_acquisition, best_inner_gains)
-        plot_bo_progression_1d(outer_optimizer, 'outer', 'log10_Kp_x', 
-                              [2, 4, 7, 15, 30, 40], ei_acquisition_outer, best_outer_gains)
-        plot_bo_progression_1d(outer_optimizer, 'outer', 'log10_Ki_x', 
-                              [2, 4, 7, 15, 30, 40], ei_acquisition_outer, best_outer_gains)
+        # # Generate 1D progression plots (slices showing EI convergence clearly)
+        # print("\nGenerating 1D progression visualizations (showing EI convergence)...")
+        # plot_bo_progression_1d(inner_optimizer, 'inner', 'log10_Kp_v', 
+        #                       [2, 4, 7, 15, 30, 50], ei_acquisition, best_inner_gains)
+        # plot_bo_progression_1d(inner_optimizer, 'inner', 'log10_Ki_v', 
+        #                       [2, 4, 7, 15, 30, 50], ei_acquisition, best_inner_gains)
+        # plot_bo_progression_1d(outer_optimizer, 'outer', 'log10_Kp_x', 
+        #                       [2, 4, 7, 15, 30, 40], ei_acquisition_outer, best_outer_gains)
+        # plot_bo_progression_1d(outer_optimizer, 'outer', 'log10_Ki_x', 
+        #                       [2, 4, 7, 15, 30, 40], ei_acquisition_outer, best_outer_gains)
         
         # Plot convergence for each stage
         fig, axs = plt.subplots(2, 1, figsize=(10, 8))
@@ -2717,7 +2740,7 @@ if __name__ == "__main__":
         
         # Run a longer validation simulation
         val_cfg = SimConfig(t0=0.0, tf=15.0, dt=0.05, x0=0.0, v0=0.0)
-        ref_val = Scenario.step_position(magnitude=0.15, t_start=1.0)  # Simple step for clear metrics
+        ref_val = Scenario.step_position(magnitude=0.1, t_start=0.5)  # Simple step for clear metrics
         
         t, x, v, u, E, KE, PE, x_ref_hist, v_ref_hist = msd.simulate_cascade_loop(
             cfg=val_cfg,
