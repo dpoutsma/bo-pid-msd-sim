@@ -996,6 +996,12 @@ class BayesianOptimizer:
                 gain_name = param_name[6:]  # Remove 'log10_' prefix
                 gains[gain_name] = 10 ** log10_value
         
+        # TEMPORARY: Apply negation if flag is set in bounds_log10
+        if self.current_stage and self.current_stage in self.bounds_log10:
+            stage_bounds = self.bounds_log10[self.current_stage]
+            if stage_bounds.get('negate_Kp_x', False) and 'Kp_x' in gains:
+                gains['Kp_x'] = -gains['Kp_x']
+        
         return gains
     
     def _apply_gains(self, gains):
@@ -2262,10 +2268,11 @@ if __name__ == "__main__":
             'log10_Ki_v': [3.0, 3.4],   # log10(Ki_v) ∈ [3.0, 3.4] => Ki_v ∈ [1000, 2512]
             },
             # Outer loop (position PI): tune second with fixed inner loop
-            # VALIDATION TEST: Bounds include known optimal (Kp=0.1, Ki=20)
+            # TEMPORARY: Testing NEGATIVE Kp_x gains (normally positive)
             'outer': {
             'log10_Kp_x': [-1.3, -0.5],  # log10(Kp_x) ∈ [-1.3, -0.5] => Kp_x ∈ [0.05, 0.32]
             'log10_Ki_x': [1.0, 1.6],    # log10(Ki_x) ∈ [1.0, 1.6] => Ki_x ∈ [10, 40]
+            'negate_Kp_x': True,         # TEMPORARY FLAG: Apply negative sign to Kp_x
             },
             # Joint optimization: fine-tune all four gains together
             'joint': {
